@@ -1,20 +1,22 @@
-# ND-SCALPING V6 - app.py PERSONALIZADO FINAL - PARA CONTA REAL (testa primeiro em PAPEL)
-# 1 FICHEIRO SO. No GitHub: apaga config.py, trading.py, exchange_management.py, state.json.
+# ND-SCALPING V6 - app.py PERSONALIZADO FINAL + REBALANCEAMENTO - PARA CONTA REAL (testa primeiro em PAPEL)
+# 1 FICHEIRO SO. No 【entity-GitHub¦canonical_name=GitHub】: apaga config.py, trading.py, exchange_management.py, state.json.
 # Render: Start Command = python app.py | Build = pip install -r requirements.txt
 #
 # RESUMO APLICADO:
 #  SALDO TOTAL 10000 fixo no codigo. SALDO EM OPERACAO defines tu (teto). MARGEM POR ORDEM defines tu (pedaco).
 #  Durante a operacao, lucros/perdas mexem SO no Saldo em operacao. Total so atualiza ao fechar (PARAR).
-#  ENTRADA decide o ROBO: analisa Bybit, janela curta, so entra em terreno LIMPO.
-#  CHAVES: vazias no Render = virtual 10000. Metidas = real, busca saldo real Bybit em tempo real.
+#  ENTRADA decide o ROBO: analisa 【entity-Bybit¦canonical_name=Bybit】, janela curta, so entra em terreno LIMPO.
+#  CHAVES: vazias no Render = virtual 10000. Metidas = real, busca saldo real 【entity-Bybit¦canonical_name=Bybit】 em tempo real.
 #  BOTAO UNICO: verde INICIAR / vermelho PARAR. TRAVA rigida no codigo: arma 0.002 liquido, segue melhor, recuo 0.
 #  DASHBOARD: Grid Ref no centro, topo amarelo Ref+Preco, SHORT esquerda / LONG direita, divisoria amarela.
-#  MERCADO: so grafico Bybit. HISTORICO: por data (dia+mes), LONG/SHORT/Total USDT + % sobre saldo operacao.
+#  MERCADO: so grafico 【entity-Bybit¦canonical_name=Bybit】. HISTORICO: por data (dia+mes), LONG/SHORT/Total USDT + % sobre saldo operacao.
 #  MEIA-NOITE: operacao continua ate lucro, mas conta toda no dia em que comecou.
 #  FECHADAS: so hora abertura -> hora fecho + liquido. ABERTAS: % que falta para o alvo.
-#  PASSO 80 + DIST 450 SO P/ CRIACAO DE ESPELHO + NORMAIS ATIVAM SEMPRE + MERCADO CONTA CADEIA
+#  REBALANCEAMENTO INFINITO: espelho nasce SEMPRE (sem 450), alavancagem SEMPRE dos Ajustes (sem gradual), sem teto 8 / 12.
+#  Em cada nascimento de espelho: fecha PENDING mais longe do preco nesse lado (normais primeiro, depois espelhos)
+#  + abre 1 normal novo no lado que fechou com lucro, a volta do preco de fecho, com nova referencia.
+#  Ambos os lados ficam com a mesma contagem, nenhum lado fica vazio. ACTIVE ficam ACTIVE ate Alvo/Trava.
 #  CORRECAO ESPELHO: GRID fecha no ALVO (ex: SHORT 57958.4 fecha em 57918.4, ESP LONG PENDING em 57928.4). TRAVA fecha no preco do tick.
-#  3 MEDIDAS DE SEGURANCA: max 8 abertas + alavancagem cai para 5 longe da Ref (>150) + nao abre novas a >200 da Ref.
 
 import os, time, threading, json, urllib.request, urllib.parse, hmac, hashlib
 from datetime import datetime, timezone
@@ -24,22 +26,8 @@ app = Flask(__name__)
 PAPER_INITIAL_BALANCE = 10000.0
 FEE_TAKER = 0.00055
 TRAVA_LIQUIDO = 0.002
-# --- 3 MEDIDAS DE SEGURANCA ---
-MAX_ABERTAS = 8
-
-def lev_por_nascimento(dist, base):
-    # Alavancagem gradual por NASCIMENTO, nunca brusca, nunca muda depois de nascer.
-    # Ate 200 = base cheia. 200-250 = base-5. 250+ = base-10, minimo 5.
-    # Ex: base 15 -> 15 / 10 / 5. Base 12 -> 12 / 7 / 5 (min 5).
-    try: b = float(base)
-    except: b = 15.0
-    if dist <= 200: return b
-    if dist <= 250: return max(5.0, b - 5.0)
-    return max(5.0, b - 10.0)
-
-DIST_LEV_BAIXA = 150.0
-LEV_LONGE = 5
-DIST_NAO_ABRIR = 200.0
+# --- REBALANCEAMENTO CONTROLA A CONTAGEM (sem teto) ---
+MAX_ABERTAS = 9999
 
 COINS = {
     "BTC": {"pair": "BTC/USDT:USDT", "bybit": "BTCUSDT", "binance": "BTCUSDT", "kraken": "XBTUSD", "bitstamp": "btcusd", "step": 90.0},
@@ -52,11 +40,11 @@ COINS = {
 TOP_PAIRS = [v["pair"] for v in COINS.values()]
 
 def has_api_keys():
-    return bool(os.getenv("BYBIT_API_KEY")) and bool(os.getenv("BYBIT_API_SECRET"))
+    return bool(os.getenv("【entity-BYBIT_API_KEY¦canonical_name=Bybit】")) and bool(os.getenv("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】"))
 
 def fetch_bybit_real_balance():
     try:
-        key = os.getenv("BYBIT_API_KEY"); sec = os.getenv("BYBIT_API_SECRET")
+        key = os.getenv("【entity-BYBIT_API_KEY¦canonical_name=Bybit】"); sec = os.getenv("【entity-BYBIT_API_SECRET¦canonical_name=Bybit】")
         ts = str(int(time.time()*1000))
         params = {"accountType": "UNIFIED", "coin": "USDT"}
         qs = urllib.parse.urlencode(params)
@@ -107,7 +95,7 @@ cfg = Cfg()
 def fetch_price():
     c = COINS.get(cfg.coin, COINS["BTC"])
     tries = [
-        (f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={c['bybit']}", "bybit"),
+        (f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={c['【entity-bybit¦canonical_name=Bybit】']}", "【entity-bybit¦canonical_name=Bybit】"),
         (f"https://api.binance.com/api/v3/ticker/price?symbol={c['binance']}", "binance"),
         (f"https://api.kraken.com/0/public/Ticker?pair={c['kraken']}", "kraken"),
         (f"https://www.bitstamp.net/api/v2/ticker/{c['bitstamp']}/", "bitstamp"),
@@ -162,6 +150,7 @@ class Engine:
         self.real_balance = None
         self._bg = False
         self._bg_thread = None
+        self._reb_counter = 0
 
     def _gross(self, o, price):
         e = float(o["entry_price"])
@@ -216,17 +205,16 @@ class Engine:
         self.per_side = half
         step = float(self.cfg.grid_step_price)
         self.grid_step = step; self.first_dist = step / 2
+        lev = float(self.cfg.leverage)
         for i in range(1, half + 1):
             e_long = ref + step/2 + (i-1)*step
-            _lev_l = lev_por_nascimento(abs(e_long - ref), self.cfg.leverage)
-            q_long = round(float(self.cfg.margin_per_order) * float(_lev_l) / e_long, 8)
+            q_long = round(float(self.cfg.margin_per_order) * float(lev) / e_long, 8)
             orders.append({"id": f"LONG_{i}", "side": "buy", "entry_price": round(e_long, 4), "entry": round(e_long, 4),
-                "target": round(e_long + step, 4), "qty": q_long, "lev": _lev_l, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
+                "target": round(e_long + step, 4), "qty": q_long, "lev": lev, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
             e_short = ref - step/2 - (i-1)*step
-            _lev_s = lev_por_nascimento(abs(e_short - ref), self.cfg.leverage)
-            q_short = round(float(self.cfg.margin_per_order) * float(_lev_s) / e_short, 8)
+            q_short = round(float(self.cfg.margin_per_order) * float(lev) / e_short, 8)
             orders.append({"id": f"SHORT_{i}", "side": "sell", "entry_price": round(e_short, 4), "entry": round(e_short, 4),
-                "target": round(e_short - step, 4), "qty": q_short, "lev": _lev_s, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
+                "target": round(e_short - step, 4), "qty": q_short, "lev": lev, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
         return orders
 
     def start_bot(self):
@@ -293,6 +281,49 @@ class Engine:
                 return {"ok": True, "active": pair, "coin": coin, "step": info["step"]}
         return {"ok": False}
 
+    def _rebalance(self, close_price, closed_side, mirror_side, mirror_id):
+        # REBALANCEAMENTO - corre 1x por nascimento de espelho, dentro do _close.
+        # 1) Fecha o PENDING mais longe do preco atual no lado do espelho (mirror_side).
+        #    Primeiro normais, depois espelhos. Nunca o espelho que acabou de nascer, nunca ACTIVE.
+        #    PENDING nunca abriu, por isso so sai da lista - nao vai para o Historico, nao mexe no cofre.
+        # 2) Abre 1 normal novo no lado que fechou com lucro (closed_side), a volta do preco de fecho,
+        #    com nova referencia = preco de fecho. Assim cada lado mantem a mesma contagem.
+        try:
+            step = float(self.cfg.grid_step_price)
+            lev = float(self.cfg.leverage)
+            cands = [x for x in list(self.orders_state) if x.get("status") == "PENDING" and x.get("side") == mirror_side and x.get("id") != mirror_id]
+            if not cands:
+                return
+            # Nenhum lado pode ficar vazio: se o lado do espelho so tem o espelho novo + este candidato, nao remover.
+            # Contamos PENDING do lado do espelho incluindo o novo espelho.
+            total_mirror_pending = sum(1 for x in self.orders_state if x.get("status") == "PENDING" and x.get("side") == mirror_side)
+            if total_mirror_pending <= 2:
+                # Se so ha o novo espelho + 1 candidato, remover deixaria so o espelho.
+                # Nesse caso removemos na mesma, porque o espelho conta como ordem do lado - o lado nao fica vazio.
+                pass
+            normals = [x for x in cands if not str(x.get("id", "")).startswith("ESP")]
+            mirrors = [x for x in cands if str(x.get("id", "")).startswith("ESP")]
+            pool = normals if normals else mirrors
+            # Mais longe do preco atual
+            victim = max(pool, key=lambda x: abs(float(x.get("entry_price", 0)) - float(close_price)))
+            self.orders_state = [x for x in self.orders_state if x.get("id") != victim.get("id")]
+            # 1 normal novo no lado que fechou com lucro
+            self._reb_counter += 1
+            if closed_side == "buy":
+                e_new = round(float(close_price) + step/2, 4)
+                tgt_new = round(e_new + step, 4)
+                nid = f"LONG_REB_{self._reb_counter}"
+            else:
+                e_new = round(float(close_price) - step/2, 4)
+                tgt_new = round(e_new - step, 4)
+                nid = f"SHORT_REB_{self._reb_counter}"
+            q_new = round(float(self.cfg.margin_per_order) * float(lev) / e_new, 8) if e_new > 0 else 0
+            self.orders_state.append({"id": nid, "side": closed_side, "entry_price": e_new, "entry": e_new,
+                "target": tgt_new, "qty": q_new, "lev": lev, "status": "PENDING", "open_price": None, "open_time": None,
+                "best_net": 0.0, "armed": False, "ref": round(float(close_price), 4)})
+        except Exception:
+            pass
+
     def _close(self, o, price, reason):
         gross = self._gross(o, price)
         fee_open = self._fee_open(o); fee_close = self._fee_close(o, price)
@@ -310,20 +341,25 @@ class Engine:
         else: self.hist_short_pnl += net
         self.cfg.cofre += net; self.cfg.cofre_global += net; self.cfg.completed_operations += 1
         opp = "sell" if o["side"] == "buy" else "buy"
-        # ESPELHO A 10, EM CADEIA: nasce PENDING, nunca ACTIVE. Mesma regra p/ tudo que nasce apos fechada.
+        # ESPELHO A 10, EM CADEIA INFINITA: nasce PENDING, nunca ACTIVE. Sem bloqueio 450.
         # Fecha LONG -> ESP SHORT PENDING em fecho - 10. Fecha SHORT -> ESP LONG PENDING em fecho + 10.
-        # 450 SO BLOQUEIA CRIACAO DE ESPELHO: se fecho >450 da Ref, nao nasce espelho, cadeia para aqui.
-        # Se nasceu dentro dos 450, depois ativa como normal, mesmo que o preco dispare p/ alem dos 450.
-        _dist_fecho = abs(price - self.reference_price) if self.reference_price else 0.0
-        if _dist_fecho <= DIST_NAO_ABRIR:
-            _esp_entry = round(price - 10.0, 4) if opp == "sell" else round(price + 10.0, 4)
-            # Lev do espelho = gradual pelo NASCIMENTO dele (dist da entrada do espelho a Ref), nao pela ordem mae.
-            _lev_esp = lev_por_nascimento(abs(_esp_entry - self.reference_price) if self.reference_price else 0.0, self.cfg.leverage)
-            _qty_esp = round(float(self.cfg.margin_per_order) * float(_lev_esp) / _esp_entry, 8)
-            self.orders_state.append({"id": f"ESP_{o['id']}", "display": "ESP LONG" if opp == "buy" else "ESP SHORT",
-                "side": opp, "entry_price": _esp_entry, "entry": _esp_entry,
-                "target": round(_esp_entry + self.cfg.grid_step_price, 4) if opp == "buy" else round(_esp_entry - self.cfg.grid_step_price, 4),
-                "qty": _qty_esp, "lev": _lev_esp, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
+        # Espelho-de-espelho usa a mesma regra, por isso a cadeia nunca para ate reversao total.
+        # TRAVA fecha no preco do tick, GRID fecha no ALVO - o espelho usa sempre o preco real de fecho.
+        _esp_entry = round(price - 10.0, 4) if opp == "sell" else round(price + 10.0, 4)
+        _lev_esp = float(self.cfg.leverage)
+        _qty_esp = round(float(self.cfg.margin_per_order) * float(_lev_esp) / _esp_entry, 8)
+        _esp_id = f"ESP_{o['id']}"
+        # Se o id ja existir (espelho-de-espelho com mesmo nome), torna-o unico para nao colidir no rebalanceamento
+        _base = _esp_id; _n = 1
+        _ids = {str(x.get("id")) for x in self.orders_state}
+        while _esp_id in _ids:
+            _n += 1; _esp_id = f"{_base}_{_n}"
+        self.orders_state.append({"id": _esp_id, "display": "ESP LONG" if opp == "buy" else "ESP SHORT",
+            "side": opp, "entry_price": _esp_entry, "entry": _esp_entry,
+            "target": round(_esp_entry + self.cfg.grid_step_price, 4) if opp == "buy" else round(_esp_entry - self.cfg.grid_step_price, 4),
+            "qty": _qty_esp, "lev": _lev_esp, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
+        # REBALANCEAMENTO logo apos o nascimento do espelho
+        self._rebalance(price, o["side"], opp, _esp_id)
         return net
 
     def tick(self, price=None):
@@ -345,18 +381,11 @@ class Engine:
                 if o.get("status") == "PENDING":
                     if uso >= float(self.cfg.saldo_operacao):
                         continue
-                    # --- 3 MEDIDAS: max 8 + lev cai p/ 5 alem de 150. 450 NAO bloqueia ativacao. ---
-                    # Normais PENDING e ESP ja criados ATIVAM SEMPRE quando o preco cruza a entrada,
-                    # mesmo que a distancia a Ref ja seja >450. 450 so bloqueia CRIACAO de espelho novo (em _close).
-                    _ativas = sum(1 for x in self.orders_state if x.get("status") == "ACTIVE")
-                    if _ativas >= MAX_ABERTAS:
-                        continue
-                    _dist_ref = abs(price - self.reference_price) if self.reference_price else 0.0
+                    # REBALANCEAMENTO controla a contagem. Normais PENDING e ESP ja criados ATIVAM SEMPRE
+                    # quando o preco cruza a entrada, a qualquer distancia da Ref. Sem teto 8 / 12 / 450.
                     _vai_ativar = (o["side"] == "buy" and price >= o["entry_price"]) or (o["side"] == "sell" and price <= o["entry_price"])
                     if not _vai_ativar:
                         continue
-                    # Lev ja esta fixa no nascimento (gradual). NUNCA cortar qty na ativacao.
-                    # --- fim 3 medidas ---
                     if o["side"] == "buy" and price >= o["entry_price"]:
                         o["status"] = "ACTIVE"; o["open_price"] = o["entry_price"]; o["open_time"] = datetime.now(timezone.utc).isoformat(); uso += float(self.cfg.margin_per_order)
                     elif o["side"] == "sell" and price <= o["entry_price"]:
@@ -513,7 +542,7 @@ document.getElementById('colShort').innerHTML=shorts.length?shorts.map(function(
 document.getElementById('colLong').innerHTML=longs.length?longs.map(function(o){return ordHtml(withLive(o));}).join(''):'Sem LONGs.';
 document.getElementById('actCount').innerText=(s.live_orders||[]).length+' ativas | '+(s.orders||[]).filter(function(o){return o.status==='PENDING';}).length+' a espera | '+(s.history||[]).length+' fechadas (ver Historico)';
 document.getElementById('mline').innerText='Preco Bybit: '+(s.last_price||'--')+' | Ref: '+(s.reference_price||'--')+' | Moeda: '+(s.coin||'BTC');
-var _ords=s.orders||[];function _cnt(side,isEsp,st){return _ords.filter(function(o){return o.side===side&&((String(o.id||'').indexOf('ESP')>=0)===isEsp)&&o.status===st;}).length;}var _lp=_cnt('buy',false,'PENDING'),_la=_cnt('buy',false,'ACTIVE'),_lep=_cnt('buy',true,'PENDING'),_lea=_cnt('buy',true,'ACTIVE');var _sp=_cnt('sell',false,'PENDING'),_sa=_cnt('sell',false,'ACTIVE'),_sep=_cnt('sell',true,'PENDING'),_sea=_cnt('sell',true,'ACTIVE');document.getElementById('contagem').innerHTML='LONG — Pending: <b>'+_lp+'</b> | Active: <b>'+_la+'</b> | Esp Pending: <b>'+_lep+'</b> | Esp Active: <b>'+_lea+'</b><br>SHORT — Pending: <b>'+_sp+'</b> | Active: <b>'+_sa+'</b> | Esp Pending: <b>'+_sep+'</b> | Esp Active: <b>'+_sea+'</b><br>Total ativas: <b>'+(_la+_lea+_sa+_sea)+'</b> / 8 max';
+var _ords=s.orders||[];function _cnt(side,isEsp,st){return _ords.filter(function(o){return o.side===side&&((String(o.id||'').indexOf('ESP')>=0)===isEsp)&&o.status===st;}).length;}var _lp=_cnt('buy',false,'PENDING'),_la=_cnt('buy',false,'ACTIVE'),_lep=_cnt('buy',true,'PENDING'),_lea=_cnt('buy',true,'ACTIVE');var _sp=_cnt('sell',false,'PENDING'),_sa=_cnt('sell',false,'ACTIVE'),_sep=_cnt('sell',true,'PENDING'),_sea=_cnt('sell',true,'ACTIVE');document.getElementById('contagem').innerHTML='LONG — Pending: <b>'+_lp+'</b> | Active: <b>'+_la+'</b> | Esp Pending: <b>'+_lep+'</b> | Esp Active: <b>'+_sea+'</b><br>SHORT — Pending: <b>'+_sp+'</b> | Active: <b>'+_sa+'</b> | Esp Pending: <b>'+_sep+'</b> | Esp Active: <b>'+_sea+'</b><br>Total ativas: <b>'+(_la+_lea+_sa+_sea)+'</b> / 8 max';
 document.getElementById('mleg').innerText='Trajetoria Bybit: '+(s.price_dir==='up'?'a subir':(s.price_dir==='down'?'a descer':'estavel'))+' | Terreno: '+(s.terreno||'--');
 var sel=document.getElementById('fData').value;var hAll=s.history||[];var h=hAll;
 if(sel){h=hAll.filter(function(x){return (x.operation_day||x.time||'').slice(0,10)===sel;});document.getElementById('hDataLabel').innerText='Dia: '+sel+' (operacoes que comecaram neste dia - se passou da meia-noite, contam no dia em que comecaram)';}
