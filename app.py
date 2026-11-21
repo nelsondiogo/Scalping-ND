@@ -12,7 +12,8 @@
 #  MERCADO: so grafico Bybit. HISTORICO: por data (dia+mes), LONG/SHORT/Total USDT + % sobre saldo operacao.
 #  MEIA-NOITE: operacao continua ate lucro, mas conta toda no dia em que comecou.
 #  FECHADAS: so hora abertura -> hora fecho + liquido. ABERTAS: % que falta para o alvo.
-#  ESPELHO A 10 DE RECUO EM CADEIA + MERCADO CONTAGEM
+#  ESPELHO A 10 DE RECUO EM CADEIA + MERCADO CONTAGEM + HISTORICO COMPACTO
+#  CORRECAO ESPELHO: GRID fecha no ALVO (ex: SHORT 57958.4 fecha em 57918.4, ESP LONG PENDING em 57928.4). TRAVA fecha no preco do tick.
 #  3 MEDIDAS DE SEGURANCA: max 8 abertas + alavancagem cai para 5 longe da Ref (>150) + nao abre novas a >200 da Ref.
 
 import os, time, threading, json, urllib.request, urllib.parse, hmac, hashlib
@@ -348,7 +349,7 @@ class Engine:
                 target = o["entry_price"] + step if o["side"] == "buy" else o["entry_price"] - step
                 hit = (price >= target) if o["side"] == "buy" else (price <= target)
                 if hit and net >= 0:
-                    self._close(o, price, "GRID V6"); continue
+                    self._close(o, target, "GRID V6"); continue
                 if net >= TRAVA_LIQUIDO: o["armed"] = True
                 if o.get("armed") and net < o.get("best_net", 0.0):
                     self._close(o, price, "TRAVA"); continue
@@ -387,7 +388,7 @@ input[readonly]{background:#0f172a;color:#94a3b8}
 .btn{width:100%;padding:13px;border:none;border-radius:12px;font-weight:800;font-size:14px;cursor:pointer;margin-top:10px}
 .btn-start{background:#22c55e;color:#000}.btn-stop{background:#ef4444;color:#fff}.btn-blue{background:#0284c7;color:#fff}
 .page{display:none}.page.active{display:block}
-.hist-item{background:#0b1220;border:1px solid #1e293b;border-radius:10px;padding:10px;margin:8px 0}
+.hist-item{background:#0b1220;border:1px solid #1e293b;border-radius:10px;padding:8px 10px;margin:6px 0;font-size:12px;line-height:1.4}.hist-item .h-small{font-size:11px;color:#94a3b8;margin-top:2px}
 canvas{width:100%;height:220px;background:#0b1220;border:1px solid #1e293b;border-radius:12px;display:block}
 .legend{display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:#94a3b8;margin:8px 0}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px;vertical-align:middle}
@@ -500,7 +501,7 @@ var tot=tl+ts;var pct=s.saldo_operacao?tot/Number(s.saldo_operacao)*100:0;
 document.getElementById('hTot').innerText=fmt(tot)+' USDT';document.getElementById('hPct').innerText='Percentagem sobre saldo da operacao ('+(s.saldo_operacao||1000)+' USDT): '+(pct>=0?'+':'')+pct.toFixed(2)+'%';
 document.getElementById('hLS').innerHTML='LONG: '+fmt(tl)+' USDT | '+tln+' ordens<br>SHORT: '+fmt(ts)+' USDT | '+tsn+' ordens';
 document.getElementById('hN').innerText=h.length+' ordens';
-document.getElementById('hlist').innerHTML=h.length?h.slice(-50).reverse().map(function(x){return '<div class="hist-item"><b>'+x.side+'</b> | '+(x.open_hhmm||'--:--')+' → '+(x.close_hhmm||'--:--')+' | <b>'+fmt(x.profit)+' USDT</b></div>';}).join(''):'Sem ordens fechadas neste dia.';
+document.getElementById('hlist').innerHTML=h.length?h.slice(-50).reverse().map(function(x){var _mot=(x.reason==='GRID V6'?'Alvo':(x.reason==='TRAVA'?'Trava':(x.reason||'')));return '<div class="hist-item"><b>'+x.side+'</b> | '+(x.open_hhmm||'--:--')+' → '+(x.close_hhmm||'--:--')+' | <b>'+fmt(x.profit)+' USDT</b><div class="h-small">'+(x.open!=null?x.open:'--')+' → '+(x.close!=null?x.close:'--')+' • '+_mot+'</div></div>';}).join(''):'Sem ordens fechadas neste dia.';
 if(document.getElementById('pg-merc').classList.contains('active'))desenhar(s);
 }).catch(function(){document.getElementById('upd').innerText='Sem ligacao ao servidor - verifica o Render.';});}
 carregar();setInterval(carregar,300);
