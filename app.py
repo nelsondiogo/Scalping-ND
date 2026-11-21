@@ -104,37 +104,27 @@ class Cfg:
 
 cfg = Cfg()
 
-_PRICE_CACHE = {"price": 0.0, "time": 0.0}
 def fetch_price():
     c = COINS.get(cfg.coin, COINS["BTC"])
-    _gecko = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "BNB": "binancecoin", "XRP": "ripple", "ADA": "cardano"}.get(cfg.coin, "bitcoin")
     tries = [
         (f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={c['bybit']}", "bybit"),
         (f"https://api.binance.com/api/v3/ticker/price?symbol={c['binance']}", "binance"),
-        (f"https://api.coinbase.com/v2/prices/{cfg.coin}-USD/spot", "coinbase"),
-        (f"https://api.coingecko.com/api/v3/simple/price?ids={_gecko}&vs_currencies=usd", "gecko"),
         (f"https://api.kraken.com/0/public/Ticker?pair={c['kraken']}", "kraken"),
         (f"https://www.bitstamp.net/api/v2/ticker/{c['bitstamp']}/", "bitstamp"),
     ]
     for url, kind in tries:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 ND-Scalping", "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=2.5) as r:
+            req = urllib.request.Request(url, headers={"User-Agent": "ND-Scalping"})
+            with urllib.request.urlopen(req, timeout=5) as r:
                 d = json.loads(r.read().decode())
                 if kind == "bybit": p = float(d["result"]["list"][0]["lastPrice"])
                 elif kind == "binance": p = float(d["price"])
-                elif kind == "coinbase": p = float(d["data"]["amount"])
-                elif kind == "gecko": p = float(d[_gecko]["usd"])
                 elif kind == "kraken":
                     k = list(d["result"].keys())[0]; p = float(d["result"][k]["c"][0])
                 else: p = float(d["last"])
-                if p > 0:
-                    _PRICE_CACHE["price"] = p; _PRICE_CACHE["time"] = time.time()
-                    return p
+                if p > 0: return p
         except Exception:
             continue
-    if _PRICE_CACHE["price"] > 0:
-        return _PRICE_CACHE["price"]
     return 0.0
 
 def hhmm(iso):
@@ -204,7 +194,7 @@ class Engine:
 
     def analisar_terreno(self):
         h = list(self.price_history)
-        if len(h) < 5:
+        if len(h) < 10:
             return ("A ANALISAR", "A recolher preco da Bybit... aguarda uns segundos.")
         cur = h[-1]
         janela = h[-60:]
@@ -241,13 +231,16 @@ class Engine:
         return orders
 
     def start_bot(self):
+        # AJUSTE: le preco do cache ANTES do lock. Nunca faz HTTP com lock fechado.
+        try: _pc = _PRICE_CACHE.get("price", 0.0)
+        except Exception: _pc = 0.0
         with self.lock:
             if has_api_keys():
                 b = fetch_bybit_real_balance()
                 if b is not None:
                     self.real_balance = b
                     self.cfg.saldo_total = round(float(b), 4)
-            p = self.last_price or fetch_price() or 0.0
+            p = self.last_price or _pc or 0.0
             if p <= 0:
                 self.cfg.status_message = "Sem preco Bybit - tenta outra vez"
                 return {"status": "error", "error": "sem preco"}
@@ -393,7 +386,10 @@ def _drenar_fila_esp(self, price):
         return net
 
     def tick(self, price=None):
-        if price is None: price = fetch_price()
+        # AJUSTE: tick NUNCA busca preco na net. So usa preco do loop de fundo ou cache.
+        if price is None or price <= 0:
+            try: price = _PRICE_CACHE.get("price", 0.0)
+            except Exception: price = 0.0
         if not price or price <= 0: return
         with self.lock:
             self.prev_price = self.last_price if self.last_price > 0 else price
@@ -458,8 +454,7 @@ def _drenar_fila_esp(self, price):
         self._bg_thread = threading.Thread(target=_loop, daemon=True); self._bg_thread.start(); return True
 
 
-# Reserva: se a classe Engine vier sem start_background_loop (ficheiro misturado no GitHub),
-# repoe o metodo aqui. Assim o arranque nunca mais da AttributeError.
+# Reserva: se a classe Engine vier sem start_background_loop, repoe o metodo. Nunca mais AttributeError.
 if not hasattr(Engine, "start_background_loop"):
     def _start_background_loop_reserva(self):
         if getattr(self, "_bg", False): return True
@@ -479,7 +474,7 @@ engine = Engine(cfg)
 try:
     engine.start_background_loop()
 except Exception:
-    pass  # arranque nunca pode matar o deploy
+    pass
 
 HTML = """<!DOCTYPE html><html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ND-Scalping</title><style>
@@ -625,10 +620,8 @@ def health():
     return jsonify({"status": "ok"})
 @app.route("/api/status")
 def status():
-    try:
-        if time.time() - engine.last_tick_time > 0.2:
-            engine.tick()
-    except Exception: pass
+    # AJUSTE: /api/status NUNCA chama tick() nem busca preco. So le o ultimo preco guardado.
+    pass
     with engine.lock:
         live_orders = []; live_total = 0.0
         for o in engine.orders_state:
@@ -730,4 +723,4 @@ def switch_pair():
     return jsonify(engine.switch_pair(d.get("selected_pair") or d.get("pair") or cfg.selected_pair))
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), threaded=True)
