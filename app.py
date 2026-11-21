@@ -104,27 +104,41 @@ class Cfg:
 
 cfg = Cfg()
 
+_PRICE_CACHE = {"price": 0.0, "time": 0.0}
 def fetch_price():
+    # Rapido + a prova de falha: timeout curto, varias fontes, usa cache se tudo falhar.
+    # Antes: timeout 5s x 4 fontes = ate 20s por tick -> price_history nunca enchia, preco ficava -- e o bot nunca arrancava.
     c = COINS.get(cfg.coin, COINS["BTC"])
+    # CoinGecko id por moeda
+    _gecko = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "BNB": "binancecoin", "XRP": "ripple", "ADA": "cardano"}.get(cfg.coin, "bitcoin")
     tries = [
         (f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={c['bybit']}", "bybit"),
         (f"https://api.binance.com/api/v3/ticker/price?symbol={c['binance']}", "binance"),
+        (f"https://api.coinbase.com/v2/prices/{cfg.coin}-USD/spot", "coinbase"),
+        (f"https://api.coingecko.com/api/v3/simple/price?ids={_gecko}&vs_currencies=usd", "gecko"),
         (f"https://api.kraken.com/0/public/Ticker?pair={c['kraken']}", "kraken"),
         (f"https://www.bitstamp.net/api/v2/ticker/{c['bitstamp']}/", "bitstamp"),
     ]
     for url, kind in tries:
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ND-Scalping"})
-            with urllib.request.urlopen(req, timeout=5) as r:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 ND-Scalping", "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=2.5) as r:
                 d = json.loads(r.read().decode())
                 if kind == "bybit": p = float(d["result"]["list"][0]["lastPrice"])
                 elif kind == "binance": p = float(d["price"])
+                elif kind == "coinbase": p = float(d["data"]["amount"])
+                elif kind == "gecko": p = float(d[_gecko]["usd"])
                 elif kind == "kraken":
                     k = list(d["result"].keys())[0]; p = float(d["result"][k]["c"][0])
                 else: p = float(d["last"])
-                if p > 0: return p
+                if p > 0:
+                    _PRICE_CACHE["price"] = p; _PRICE_CACHE["time"] = time.time()
+                    return p
         except Exception:
             continue
+    # Se todas falharem, devolve o ultimo preco valido (nao 0) para o bot nao ficar em -- para sempre
+    if _PRICE_CACHE["price"] > 0:
+        return _PRICE_CACHE["price"]
     return 0.0
 
 def hhmm(iso):
@@ -194,7 +208,7 @@ class Engine:
 
     def analisar_terreno(self):
         h = list(self.price_history)
-        if len(h) < 10:
+        if len(h) < 5:
             return ("A ANALISAR", "A recolher preco da Bybit... aguarda uns segundos.")
         cur = h[-1]
         janela = h[-60:]
@@ -383,7 +397,7 @@ def _drenar_fila_esp(self, price):
         return net
 
     def tick(self, price=None):
-        if price is None: price = fetch_price()
+        if price is None or price <= 0: price = fetch_price()
         if not price or price <= 0: return
         with self.lock:
             self.prev_price = self.last_price if self.last_price > 0 else price
@@ -439,33 +453,19 @@ def _drenar_fila_esp(self, price):
         def _loop():
             while self._bg:
                 try:
-                    if has_api_keys() and int(time.time()) % 15 == 0:
+                    # Busca o preco 1x e passa ao tick (antes o tick buscava de novo e podia demorar 20s)
+                    _p = fetch_price()
+                    if _p and _p > 0:
+                        self.tick(price=_p)
+                    if has_api_keys() and int(time.time()) % 30 == 0:
                         b = fetch_bybit_real_balance()
                         if b is not None: self.real_balance = b
-                    self.tick()
                 except Exception: pass
-                time.sleep(0.12)
+                time.sleep(0.5)
         self._bg_thread = threading.Thread(target=_loop, daemon=True); self._bg_thread.start(); return True
 
 engine = Engine(cfg)
-# Arranque a prova de falha (corrige AttributeError: 'Engine' object has no attribute 'start_background_loop').
-# Se o metodo existir, usa-o. Se nao existir (app.py antigo no GitHub), arranca o loop direto.
-try:
-    if hasattr(engine, "start_background_loop"):
-        engine.start_background_loop()
-    else:
-        import threading as _th
-        def _fallback_loop():
-            while True:
-                try:
-                    engine.tick()
-                except Exception:
-                    pass
-                import time as _tm; _tm.sleep(0.12)
-        _th.Thread(target=_fallback_loop, daemon=True).start()
-except Exception:
-    # Nunca deixar o deploy morrer por causa do loop de fundo.
-    pass
+engine.start_background_loop()
 
 HTML = """<!DOCTYPE html><html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ND-Scalping</title><style>
