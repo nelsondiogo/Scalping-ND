@@ -448,7 +448,7 @@ def _drenar_fila_esp(self, price):
         self._bg_thread = threading.Thread(target=_loop, daemon=True); self._bg_thread.start(); return True
 
 engine = Engine(cfg)
-engine.start_background_loop()
+# Linha 451 removida: era ela que matava o deploy com AttributeError. O preco continua a atualizar via /api/status -> tick(), como antes.
 
 HTML = """<!DOCTYPE html><html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ND-Scalping</title><style>
