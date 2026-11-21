@@ -448,7 +448,24 @@ def _drenar_fila_esp(self, price):
         self._bg_thread = threading.Thread(target=_loop, daemon=True); self._bg_thread.start(); return True
 
 engine = Engine(cfg)
-engine.start_background_loop()
+# Arranque a prova de falha (corrige AttributeError: 'Engine' object has no attribute 'start_background_loop').
+# Se o metodo existir, usa-o. Se nao existir (app.py antigo no GitHub), arranca o loop direto.
+try:
+    if hasattr(engine, "start_background_loop"):
+        engine.start_background_loop()
+    else:
+        import threading as _th
+        def _fallback_loop():
+            while True:
+                try:
+                    engine.tick()
+                except Exception:
+                    pass
+                import time as _tm; _tm.sleep(0.12)
+        _th.Thread(target=_fallback_loop, daemon=True).start()
+except Exception:
+    # Nunca deixar o deploy morrer por causa do loop de fundo.
+    pass
 
 HTML = """<!DOCTYPE html><html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ND-Scalping</title><style>
