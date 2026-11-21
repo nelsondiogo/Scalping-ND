@@ -12,6 +12,7 @@
 #  MERCADO: so grafico Bybit. HISTORICO: por data (dia+mes), LONG/SHORT/Total USDT + % sobre saldo operacao.
 #  MEIA-NOITE: operacao continua ate lucro, mas conta toda no dia em que comecou.
 #  FECHADAS: so hora abertura -> hora fecho + liquido. ABERTAS: % que falta para o alvo.
+#  ESPELHO A 10 DE RECUO EM CADEIA + MERCADO CONTAGEM
 #  3 MEDIDAS DE SEGURANCA: max 8 abertas + alavancagem cai para 5 longe da Ref (>150) + nao abre novas a >200 da Ref.
 
 import os, time, threading, json, urllib.request, urllib.parse, hmac, hashlib
@@ -295,10 +296,13 @@ class Engine:
         else: self.hist_short_pnl += net
         self.cfg.cofre += net; self.cfg.cofre_global += net; self.cfg.completed_operations += 1
         opp = "sell" if o["side"] == "buy" else "buy"
+        # ESPELHO A 10 DE RECUO, EM CADEIA: nasce PENDING, nao ACTIVE.
+        # Fecha LONG -> ESP SHORT PENDING em fecho - 10. Fecha SHORT -> ESP LONG PENDING em fecho + 10.
+        _esp_entry = round(price - 10.0, 4) if opp == "sell" else round(price + 10.0, 4)
         self.orders_state.append({"id": f"ESP_{o['id']}", "display": "ESP LONG" if opp == "buy" else "ESP SHORT",
-            "side": opp, "entry_price": round(price, 4), "entry": round(price, 4),
-            "target": round(price + self.cfg.grid_step_price, 4) if opp == "buy" else round(price - self.cfg.grid_step_price, 4),
-            "qty": o["qty"], "status": "ACTIVE", "open_price": round(price, 4), "open_time": now_iso, "best_net": 0.0, "armed": False})
+            "side": opp, "entry_price": _esp_entry, "entry": _esp_entry,
+            "target": round(_esp_entry + self.cfg.grid_step_price, 4) if opp == "buy" else round(_esp_entry - self.cfg.grid_step_price, 4),
+            "qty": o["qty"], "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
         return net
 
     def tick(self, price=None):
@@ -413,7 +417,8 @@ canvas{width:100%;height:220px;background:#0b1220;border:1px solid #1e293b;borde
 <div id="pg-merc" class="page"><div class="card"><h3>Mercado - Grafico Bybit</h3><div class="muted" id="mline">--</div>
 <canvas id="chart" width="480" height="220"></canvas>
 <div class="legend"><span><span class="dot" style="background:#38bdf8"></span>Preco Bybit</span><span><span class="dot" style="background:#f59e0b"></span>Ref (escolhida pelo robo)</span><span><span class="dot" style="background:#22c55e"></span>Entradas LONG</span><span><span class="dot" style="background:#ef4444"></span>Entradas SHORT</span></div>
-<div class="muted" id="mleg">A linha azul e a trajetoria do preco na Bybit.</div></div></div>
+<div class="muted" id="mleg">A linha azul e a trajetoria do preco na Bybit.</div>
+<div class="card" style="margin-top:12px;margin-bottom:0"><h3>Ordens abertas - Contagem</h3><div class="muted" id="contagem">--</div></div></div></div>
 <div id="pg-hist" class="page"><div class="card"><h3>Historico - Por data</h3>
 <label>Escolhe o dia</label><input id="fData" type="date" onchange="carregar()">
 <div class="muted" id="hDataLabel">--</div>
@@ -485,6 +490,7 @@ document.getElementById('colShort').innerHTML=shorts.length?shorts.map(function(
 document.getElementById('colLong').innerHTML=longs.length?longs.map(function(o){return ordHtml(withLive(o));}).join(''):'Sem LONGs.';
 document.getElementById('actCount').innerText=(s.live_orders||[]).length+' ativas | '+(s.orders||[]).filter(function(o){return o.status==='PENDING';}).length+' a espera | '+(s.history||[]).length+' fechadas (ver Historico)';
 document.getElementById('mline').innerText='Preco Bybit: '+(s.last_price||'--')+' | Ref: '+(s.reference_price||'--')+' | Moeda: '+(s.coin||'BTC');
+var _ords=s.orders||[];function _cnt(side,isEsp,st){return _ords.filter(function(o){return o.side===side&&((String(o.id||'').indexOf('ESP')===0)===isEsp)&&o.status===st;}).length;}var _lp=_cnt('buy',false,'PENDING'),_la=_cnt('buy',false,'ACTIVE'),_lep=_cnt('buy',true,'PENDING'),_lea=_cnt('buy',true,'ACTIVE');var _sp=_cnt('sell',false,'PENDING'),_sa=_cnt('sell',false,'ACTIVE'),_sep=_cnt('sell',true,'PENDING'),_sea=_cnt('sell',true,'ACTIVE');document.getElementById('contagem').innerHTML='LONG — Pending: <b>'+_lp+'</b> | Active: <b>'+_la+'</b> | Esp Pending: <b>'+_lep+'</b> | Esp Active: <b>'+_lea+'</b><br>SHORT — Pending: <b>'+_sp+'</b> | Active: <b>'+_sa+'</b> | Esp Pending: <b>'+_sep+'</b> | Esp Active: <b>'+_sea+'</b><br>Total ativas: <b>'+(_la+_lea+_sa+_sea)+'</b> / 8 max';
 document.getElementById('mleg').innerText='Trajetoria Bybit: '+(s.price_dir==='up'?'a subir':(s.price_dir==='down'?'a descer':'estavel'))+' | Terreno: '+(s.terreno||'--');
 var sel=document.getElementById('fData').value;var hAll=s.history||[];var h=hAll;
 if(sel){h=hAll.filter(function(x){return (x.operation_day||x.time||'').slice(0,10)===sel;});document.getElementById('hDataLabel').innerText='Dia: '+sel+' (operacoes que comecaram neste dia - se passou da meia-noite, contam no dia em que comecaram)';}
