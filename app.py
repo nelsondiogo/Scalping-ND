@@ -26,6 +26,17 @@ FEE_TAKER = 0.00055
 TRAVA_LIQUIDO = 0.002
 # --- 3 MEDIDAS DE SEGURANCA ---
 MAX_ABERTAS = 8
+
+def lev_por_nascimento(dist, base):
+    # Alavancagem gradual por NASCIMENTO, nunca brusca, nunca muda depois de nascer.
+    # Ate 200 = base cheia. 200-250 = base-5. 250+ = base-10, minimo 5.
+    # Ex: base 15 -> 15 / 10 / 5. Base 12 -> 12 / 7 / 5 (min 5).
+    try: b = float(base)
+    except: b = 15.0
+    if dist <= 200: return b
+    if dist <= 250: return max(5.0, b - 5.0)
+    return max(5.0, b - 10.0)
+
 DIST_LEV_BAIXA = 150.0
 LEV_LONGE = 5
 DIST_NAO_ABRIR = 200.0
@@ -207,13 +218,15 @@ class Engine:
         self.grid_step = step; self.first_dist = step / 2
         for i in range(1, half + 1):
             e_long = ref + step/2 + (i-1)*step
-            q_long = round(float(self.cfg.margin_per_order) * float(self.cfg.leverage) / e_long, 8)
+            _lev_l = lev_por_nascimento(abs(e_long - ref), self.cfg.leverage)
+            q_long = round(float(self.cfg.margin_per_order) * float(_lev_l) / e_long, 8)
             orders.append({"id": f"LONG_{i}", "side": "buy", "entry_price": round(e_long, 4), "entry": round(e_long, 4),
-                "target": round(e_long + step, 4), "qty": q_long, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
+                "target": round(e_long + step, 4), "qty": q_long, "lev": _lev_l, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
             e_short = ref - step/2 - (i-1)*step
-            q_short = round(float(self.cfg.margin_per_order) * float(self.cfg.leverage) / e_short, 8)
+            _lev_s = lev_por_nascimento(abs(e_short - ref), self.cfg.leverage)
+            q_short = round(float(self.cfg.margin_per_order) * float(_lev_s) / e_short, 8)
             orders.append({"id": f"SHORT_{i}", "side": "sell", "entry_price": round(e_short, 4), "entry": round(e_short, 4),
-                "target": round(e_short - step, 4), "qty": q_short, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
+                "target": round(e_short - step, 4), "qty": q_short, "lev": _lev_s, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
         return orders
 
     def start_bot(self):
@@ -304,10 +317,13 @@ class Engine:
         _dist_fecho = abs(price - self.reference_price) if self.reference_price else 0.0
         if _dist_fecho <= DIST_NAO_ABRIR:
             _esp_entry = round(price - 10.0, 4) if opp == "sell" else round(price + 10.0, 4)
+            # Lev do espelho = gradual pelo NASCIMENTO dele (dist da entrada do espelho a Ref), nao pela ordem mae.
+            _lev_esp = lev_por_nascimento(abs(_esp_entry - self.reference_price) if self.reference_price else 0.0, self.cfg.leverage)
+            _qty_esp = round(float(self.cfg.margin_per_order) * float(_lev_esp) / _esp_entry, 8)
             self.orders_state.append({"id": f"ESP_{o['id']}", "display": "ESP LONG" if opp == "buy" else "ESP SHORT",
                 "side": opp, "entry_price": _esp_entry, "entry": _esp_entry,
                 "target": round(_esp_entry + self.cfg.grid_step_price, 4) if opp == "buy" else round(_esp_entry - self.cfg.grid_step_price, 4),
-                "qty": o["qty"], "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
+                "qty": _qty_esp, "lev": _lev_esp, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
         return net
 
     def tick(self, price=None):
@@ -339,8 +355,7 @@ class Engine:
                     _vai_ativar = (o["side"] == "buy" and price >= o["entry_price"]) or (o["side"] == "sell" and price <= o["entry_price"])
                     if not _vai_ativar:
                         continue
-                    if _dist_ref > DIST_LEV_BAIXA and float(self.cfg.leverage):
-                        o["qty"] = round(float(o["qty"]) * (LEV_LONGE / float(self.cfg.leverage)), 8)
+                    # Lev ja esta fixa no nascimento (gradual). NUNCA cortar qty na ativacao.
                     # --- fim 3 medidas ---
                     if o["side"] == "buy" and price >= o["entry_price"]:
                         o["status"] = "ACTIVE"; o["open_price"] = o["entry_price"]; o["open_time"] = datetime.now(timezone.utc).isoformat(); uso += float(self.cfg.margin_per_order)
@@ -355,7 +370,10 @@ class Engine:
                 if hit and net >= 0:
                     self._close(o, target, "GRID V6"); continue
                 if net >= TRAVA_LIQUIDO: o["armed"] = True
-                if o.get("armed") and net < o.get("best_net", 0.0):
+                # TRAVA NUNCA FECHA NEGATIVA: so fecha por trava se ja armou a +0.002 E o net atual ainda >=0.
+                # Se o preco recuou tanto que o net ja esta negativo, nao fechar por trava - esperar Alvo.
+                # Isso corrige o caso SHORT 60430.2 -> 60364.3 Trava -0.0007.
+                if o.get("armed") and net < o.get("best_net", 0.0) and net >= 0:
                     self._close(o, price, "TRAVA"); continue
 
     def start_background_loop(self):
