@@ -141,6 +141,7 @@ class Engine:
         self.lock = threading.Lock()
         self.reference_price = 0.0
         self.orders_state = []
+        self.esp_queue = []  # espelhos a espera de lugar (teto 6+6)
         self.history = []
         self.closed_orders = []
         self.hist_long_pnl = 0.0
@@ -218,15 +219,15 @@ class Engine:
         self.grid_step = step; self.first_dist = step / 2
         for i in range(1, half + 1):
             e_long = ref + step/2 + (i-1)*step
-            _lev_l = lev_por_nascimento(abs(e_long - ref), self.cfg.leverage)
+            _lev_l = float(self.cfg.leverage)
             q_long = round(float(self.cfg.margin_per_order) * float(_lev_l) / e_long, 8)
             orders.append({"id": f"LONG_{i}", "side": "buy", "entry_price": round(e_long, 4), "entry": round(e_long, 4),
-                "target": round(e_long + step, 4), "qty": q_long, "lev": _lev_l, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
+                "target": round(e_long + step, 4), "qty": q_long, "lev": _lev_l, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False, "created_at": __import__("time").time()})
             e_short = ref - step/2 - (i-1)*step
-            _lev_s = lev_por_nascimento(abs(e_short - ref), self.cfg.leverage)
+            _lev_s = float(self.cfg.leverage)
             q_short = round(float(self.cfg.margin_per_order) * float(_lev_s) / e_short, 8)
             orders.append({"id": f"SHORT_{i}", "side": "sell", "entry_price": round(e_short, 4), "entry": round(e_short, 4),
-                "target": round(e_short - step, 4), "qty": q_short, "lev": _lev_s, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
+                "target": round(e_short - step, 4), "qty": q_short, "lev": _lev_s, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False, "created_at": __import__("time").time()})
         return orders
 
     def start_bot(self):
@@ -244,6 +245,7 @@ class Engine:
             self.aguardando_entrada = True
             self.reference_price = 0.0
             self.orders_state = []
+            self.esp_queue = []
             self.cfg.cofre = 0.0
             self.cfg.status_message = "A ANALISAR - Bybit"
             self.terreno, self.analise_msg = self.analisar_terreno()
@@ -293,6 +295,30 @@ class Engine:
                 return {"ok": True, "active": pair, "coin": coin, "step": info["step"]}
         return {"ok": False}
 
+
+def _esp_vivos(self, side):
+    return sum(1 for x in self.orders_state if x.get("status") in ("PENDING","ACTIVE") and str(x.get("id","")).find("ESP")>=0 and x.get("side")==side)
+def _criar_esp(self, opp, entry):
+    # Cria ESP com alavancagem dos Ajustes, sempre. Sem queda gradual, sem bloqueio.
+    import time as _t
+    _lev = float(self.cfg.leverage)
+    _qty = round(float(self.cfg.margin_per_order) * float(_lev) / entry, 8) if entry>0 else 0
+    self.orders_state.append({"id": f"ESP_{opp}_{int(_t.time()*1000)%1000000}_{len(self.orders_state)}", "display": "ESP LONG" if opp=="buy" else "ESP SHORT",
+        "side": opp, "entry_price": round(entry,4), "entry": round(entry,4),
+        "target": round(entry + self.cfg.grid_step_price,4) if opp=="buy" else round(entry - self.cfg.grid_step_price,4),
+        "qty": _qty, "lev": _lev, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False, "created_at": _t.time()})
+    return True
+def _drenar_fila_esp(self, price):
+    # Quando um ESP fecha, liberta lugar -> nasce o da fila, se a entrada ainda fizer sentido.
+    if not getattr(self, "esp_queue", None): return
+    for _q in list(self.esp_queue):
+        _opp = _q["opp"]; _entry = _q["entry"]
+        if self._esp_vivos(_opp) >= 6: continue
+        # Nao nascer espelho morto: se o preco ja passou a entrada em mais de 10, deita fora
+        if _opp=="sell" and price < _entry - 10: self.esp_queue.remove(_q); continue
+        if _opp=="buy" and price > _entry + 10: self.esp_queue.remove(_q); continue
+        self._criar_esp(_opp, _entry); self.esp_queue.remove(_q)
+
     def _close(self, o, price, reason):
         gross = self._gross(o, price)
         fee_open = self._fee_open(o); fee_close = self._fee_close(o, price)
@@ -314,16 +340,46 @@ class Engine:
         # Fecha LONG -> ESP SHORT PENDING em fecho - 10. Fecha SHORT -> ESP LONG PENDING em fecho + 10.
         # 450 SO BLOQUEIA CRIACAO DE ESPELHO: se fecho >450 da Ref, nao nasce espelho, cadeia para aqui.
         # Se nasceu dentro dos 450, depois ativa como normal, mesmo que o preco dispare p/ alem dos 450.
-        _dist_fecho = abs(price - self.reference_price) if self.reference_price else 0.0
-        if _dist_fecho <= DIST_NAO_ABRIR:
-            _esp_entry = round(price - 10.0, 4) if opp == "sell" else round(price + 10.0, 4)
-            # Lev do espelho = gradual pelo NASCIMENTO dele (dist da entrada do espelho a Ref), nao pela ordem mae.
-            _lev_esp = lev_por_nascimento(abs(_esp_entry - self.reference_price) if self.reference_price else 0.0, self.cfg.leverage)
-            _qty_esp = round(float(self.cfg.margin_per_order) * float(_lev_esp) / _esp_entry, 8)
-            self.orders_state.append({"id": f"ESP_{o['id']}", "display": "ESP LONG" if opp == "buy" else "ESP SHORT",
-                "side": opp, "entry_price": _esp_entry, "entry": _esp_entry,
-                "target": round(_esp_entry + self.cfg.grid_step_price, 4) if opp == "buy" else round(_esp_entry - self.cfg.grid_step_price, 4),
-                "qty": _qty_esp, "lev": _lev_esp, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
+        # SEM BLOQUEIO 450, SEM TETO, SEM ALAVANCAGEM GRADUAL.
+        # Espelho nasce SEMPRE, a qualquer distancia, com alavancagem dos Ajustes.
+        # Fecha LONG -> ESP SHORT em fecho -10. Fecha SHORT -> ESP LONG em fecho +10. Sempre PENDING.
+        _esp_entry = round(price - 10.0, 4) if opp == "sell" else round(price + 10.0, 4)
+        self._criar_esp(opp, _esp_entry)
+        # REBALANCEAMENTO A CADA ESPELHO: mantem mesmo numero por lado.
+        # 1) Fecha o PENDING mais distante do preco atual, no lado onde nasceu o espelho.
+        #    Primeiro normais, depois espelhos (se ja nao houver normais).
+        #    Nao fecha o espelho que acabou de nascer, nem ordens ACTIVE.
+        # 2) Abre 1 normal novo no lado que fechou com lucro, a volta do preco de fecho (nova referencia).
+        try:
+            _lado_esp = opp
+            _candidatos = [x for x in list(self.orders_state) if x.get("status")=="PENDING" and x.get("side")==_lado_esp and x is not self.orders_state[-1]]
+            # Excluir o espelho recem-criado (ultimo da lista) - ele nao pode ser fechado ja
+            # Na pratica, o ultimo e o novo ESP; filtrar por id diferente do ultimo
+            _novo_id = self.orders_state[-1].get("id") if self.orders_state else None
+            _candidatos = [x for x in _candidatos if x.get("id") != _novo_id]
+            if _candidatos:
+                # Primeiro normais, depois espelhos
+                _normais = [x for x in _candidatos if "ESP" not in str(x.get("id",""))]
+                _pool = _normais if _normais else _candidatos
+                # Mais distante do preco atual
+                _alvo = max(_pool, key=lambda x: abs(float(x.get("entry_price",0)) - price))
+                self.orders_state.remove(_alvo)
+            # Abre 1 normal no lado que fechou (lado original o['side'])
+            _lado_orig = o["side"]
+            _step = float(self.cfg.grid_step_price)
+            # Nova referencia = preco de fecho. Normal novo a volta dela, a acompanhar o preco.
+            if _lado_orig == "buy":
+                _e_new = round(price + _step/2, 4)
+            else:
+                _e_new = round(price - _step/2, 4)
+            _q_new = round(float(self.cfg.margin_per_order) * float(self.cfg.leverage) / _e_new, 8) if _e_new>0 else 0
+            import time as _t2
+            self.orders_state.append({"id": f"{'LONG' if _lado_orig=='buy' else 'SHORT'}_RB_{int(_t2.time()*1000)%1000000}", "side": _lado_orig,
+                "entry_price": _e_new, "entry": _e_new,
+                "target": round(_e_new + _step,4) if _lado_orig=="buy" else round(_e_new - _step,4),
+                "qty": _q_new, "lev": float(self.cfg.leverage), "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False, "created_at": _t2.time()})
+        except Exception:
+            pass
         return net
 
     def tick(self, price=None):
@@ -341,6 +397,7 @@ class Engine:
             step = float(self.cfg.grid_step_price)
             ativas = sum(1 for x in self.orders_state if x.get("status") == "ACTIVE")
             uso = ativas * float(self.cfg.margin_per_order)
+            # Sem cancelamento de ESP velho, sem fila. Rebalanceamento trata disso.
             for o in list(self.orders_state):
                 if o.get("status") == "PENDING":
                     if uso >= float(self.cfg.saldo_operacao):
@@ -487,7 +544,7 @@ ctx.fillStyle='#38bdf8';ctx.beginPath();ctx.arc(X(hist.length-1),Y(hist[hist.len
 if(s.reference_price){ctx.strokeStyle='#f59e0b';ctx.setLineDash([6,4]);ctx.beginPath();ctx.moveTo(10,Y(s.reference_price));ctx.lineTo(W-10,Y(s.reference_price));ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='#f59e0b';ctx.font='11px Arial';ctx.fillText('Ref '+s.reference_price,12,Y(s.reference_price)-4);}
 entries.forEach(function(e,i){var o=(s.orders||[]).filter(function(x){return x.status==='ACTIVE'||x.status==='PENDING';})[i];if(!o)return;ctx.fillStyle=o.side==='buy'?'#22c55e':'#ef4444';ctx.beginPath();ctx.arc(W-16,Y(e),3,0,7);ctx.fill();});
 }
-function ordHtml(o){return '<div class="ord"><b>'+shortNome(o)+'</b> • '+o.status+'<br>'+o.entry_price+' → '+o.target+' • <span class="'+(o.pnl_live>=0?'green':'red')+'">'+fmt(o.pnl_live)+'</span><br>Falta <b>'+(o.falta_pct!=null?o.falta_pct:100)+'%</b> para o alvo</div>';}
+function ordHtml(o){var _f=(o.falta_pct!=null?o.falta_pct:100);var _c=_f<=20?'green':(_f>=80?'red':'');return '<div class="ord"><b>'+shortNome(o)+'</b> • '+o.status+'<br><b class="'+_c+'">'+_f+'% -> Alvo</b></div>';}
 function carregar(){fetch('/api/status').then(function(r){return r.json();}).then(function(s){LAST=s;
 var tb=document.getElementById('toggleBtn');tb.innerText=s.is_running?'PARAR ROBÔ':'INICIAR ROBÔ';tb.className='btn '+(s.is_running?'btn-stop':'btn-start');
 document.getElementById('modeBadge').innerText=s.paper_trading?'PAPEL':'REAL';document.getElementById('modeBadge').className='badge '+(s.paper_trading?'badge-paper':'badge-real');
