@@ -149,9 +149,21 @@ class Engine:
     def _gross(self, o, price):
         e = float(o["entry_price"])
         return (price - e) * o["qty"] if o["side"] == "buy" else (e - price) * o["qty"]
+    # TAXA POR ORDEM, EM 2 TEMPOS (como pediste):
+    #  Ao abrir: so taxa de abertura. Ao fechar: entra a taxa de fecho.
+    #  PAPEL: o codigo simula o que a Bybit faria. REAL: a Bybit ja desconta sozinha,
+    #  o codigo apenas le o resultado - por isso aqui nunca se desconta 2 vezes.
+    def _fee_open(self, o):
+        return FEE_TAKER * float(o["entry_price"]) * o["qty"]
+    def _fee_close(self, o, price):
+        return FEE_TAKER * price * o["qty"]
     def _fee(self, o, price):
-        return FEE_TAKER * (float(o["entry_price"]) + price) * o["qty"]
+        return self._fee_open(o) + self._fee_close(o, price)
+    def _net_live(self, o, price):
+        # Aberta: bruto - taxa de abertura SO. Nasce perto de 0, oscila + / -.
+        return self._gross(o, price) - self._fee_open(o)
     def _net(self, o, price):
+        # Para DECIDIR trava/alvo: liquido real se fechasse AGORA (as 2 taxas).
         return self._gross(o, price) - self._fee(o, price)
     def _falta_pct(self, o, price):
         # % que falta para o alvo. 100% = no inicio, 0% = chegou.
@@ -263,12 +275,15 @@ class Engine:
         return {"ok": False}
 
     def _close(self, o, price, reason):
-        gross = self._gross(o, price); fee = self._fee(o, price); net = gross - fee
+        gross = self._gross(o, price)
+        fee_open = self._fee_open(o); fee_close = self._fee_close(o, price)
+        fee = fee_open + fee_close; net = gross - fee
         o["status"] = "CLOSED"
         now_iso = datetime.now(timezone.utc).isoformat()
         rec = {"side": "LONG" if o["side"] == "buy" else "SHORT", "open": o["entry_price"], "close": round(price, 4),
                "entry_price": o["entry_price"], "exit": round(price, 4), "gross": round(gross, 4), "fee": round(fee, 4),
-               "profit": round(net, 4), "pnl": round(net, 4), "reason": reason, "id": o["id"],
+               "profit": round(net, 4), "pnl": round(net, 4), "fee_open": round(fee_open, 4), "fee_close": round(fee_close, 4),
+               "reason": reason, "id": o["id"],
                "open_time": o.get("open_time") or now_iso, "close_time": now_iso, "time": now_iso,
                "operation_day": self.operation_day or now_iso[:10]}
         self.history.append(rec); self.closed_orders.append(rec)
@@ -447,7 +462,7 @@ document.getElementById('tot').innerText=fmt(s.live_total||0);
 document.getElementById('cofre').innerText='Cofre ciclo: '+Number(s.cofre||0).toFixed(4)+' | Cofre global: '+Number(s.cofre_global||0).toFixed(4);
 document.getElementById('emuso').innerText='Saldo da operacao: '+(s.saldo_operacao||1000)+' USDT | Em uso: '+Number((s.margin_per_order||30)*(s.live_orders||[]).length).toFixed(2)+' / '+(s.saldo_operacao||1000)+' USDT';
 document.getElementById('gridPill').innerText='Ref: '+(s.reference_price||'--')+' • Preço: '+(s.last_price||'--');
-document.getElementById('gridNota').innerText='Trava rigida: arma a +0.002 liquido, segue o melhor, recuo 0. 1 tick contra fecha.';
+document.getElementById('gridNota').innerText='Trava rigida: arma a +0.002 liquido, segue o melhor, recuo 0. 1 tick contra fecha. Taxa: abertura ao abrir, fecho so ao fechar.';
 var shorts=(s.orders||[]).filter(function(o){return o.side==='sell';});var longs=(s.orders||[]).filter(function(o){return o.side==='buy';});
 var liveMap={};(s.live_orders||[]).forEach(function(o){liveMap[o.id]=o;});
 function withLive(o){var l=liveMap[o.id];if(l){o.pnl_live=l.pnl_live;o.falta_pct=l.falta_pct;}else{o.pnl_live=0;o.falta_pct=100;}return o;}
@@ -485,7 +500,7 @@ def status():
         live_orders = []; live_total = 0.0
         for o in engine.orders_state:
             if o.get("status") != "ACTIVE": continue
-            pnl = engine._net(o, engine.last_price) if engine.last_price > 0 else 0.0
+            pnl = engine._net_live(o, engine.last_price) if engine.last_price > 0 else 0.0
             live_total += pnl
             oo = dict(o); oo["pnl_live"] = round(pnl, 4); oo["price_now"] = engine.last_price
             oo["falta_pct"] = engine._falta_pct(o, engine.last_price)
@@ -499,7 +514,7 @@ def status():
             o["falta_pct"] = engine._falta_pct(o, engine.last_price) if o.get("status") == "ACTIVE" else 100.0
             # pnl_live para grelha: ACTIVE usa live, PENDING 0
             if o.get("status") == "ACTIVE":
-                o["pnl_live"] = round(engine._net(o, engine.last_price), 4) if engine.last_price else 0.0
+                o["pnl_live"] = round(engine._net_live(o, engine.last_price), 4) if engine.last_price else 0.0
             else:
                 o["pnl_live"] = 0.0
         hist_out = []
