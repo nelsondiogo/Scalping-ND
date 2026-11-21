@@ -231,16 +231,13 @@ class Engine:
         return orders
 
     def start_bot(self):
-        # AJUSTE: le preco do cache ANTES do lock. Nunca faz HTTP com lock fechado.
-        try: _pc = _PRICE_CACHE.get("price", 0.0)
-        except Exception: _pc = 0.0
         with self.lock:
             if has_api_keys():
                 b = fetch_bybit_real_balance()
                 if b is not None:
                     self.real_balance = b
                     self.cfg.saldo_total = round(float(b), 4)
-            p = self.last_price or _pc or 0.0
+            p = self.last_price or fetch_price() or 0.0
             if p <= 0:
                 self.cfg.status_message = "Sem preco Bybit - tenta outra vez"
                 return {"status": "error", "error": "sem preco"}
@@ -386,10 +383,7 @@ def _drenar_fila_esp(self, price):
         return net
 
     def tick(self, price=None):
-        # AJUSTE: tick NUNCA busca preco na net. So usa preco do loop de fundo ou cache.
-        if price is None or price <= 0:
-            try: price = _PRICE_CACHE.get("price", 0.0)
-            except Exception: price = 0.0
+        if price is None: price = fetch_price()
         if not price or price <= 0: return
         with self.lock:
             self.prev_price = self.last_price if self.last_price > 0 else price
@@ -453,28 +447,8 @@ def _drenar_fila_esp(self, price):
                 time.sleep(0.12)
         self._bg_thread = threading.Thread(target=_loop, daemon=True); self._bg_thread.start(); return True
 
-
-# Reserva: se a classe Engine vier sem start_background_loop, repoe o metodo. Nunca mais AttributeError.
-if not hasattr(Engine, "start_background_loop"):
-    def _start_background_loop_reserva(self):
-        if getattr(self, "_bg", False): return True
-        self._bg = True
-        def _loop():
-            while getattr(self, "_bg", False):
-                try:
-                    _pp = fetch_price()
-                    if _pp and _pp > 0: self.tick(price=_pp)
-                except Exception: pass
-                import time as _tm; _tm.sleep(0.5)
-        import threading as _th
-        self._bg_thread = _th.Thread(target=_loop, daemon=True); self._bg_thread.start(); return True
-    Engine.start_background_loop = _start_background_loop_reserva
-
 engine = Engine(cfg)
-try:
-    engine.start_background_loop()
-except Exception:
-    pass
+engine.start_background_loop()
 
 HTML = """<!DOCTYPE html><html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ND-Scalping</title><style>
@@ -620,8 +594,10 @@ def health():
     return jsonify({"status": "ok"})
 @app.route("/api/status")
 def status():
-    # AJUSTE: /api/status NUNCA chama tick() nem busca preco. So le o ultimo preco guardado.
-    pass
+    try:
+        if time.time() - engine.last_tick_time > 0.2:
+            engine.tick()
+    except Exception: pass
     with engine.lock:
         live_orders = []; live_total = 0.0
         for o in engine.orders_state:
@@ -723,4 +699,4 @@ def switch_pair():
     return jsonify(engine.switch_pair(d.get("selected_pair") or d.get("pair") or cfg.selected_pair))
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), threaded=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
