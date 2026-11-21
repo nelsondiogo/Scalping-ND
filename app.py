@@ -353,7 +353,7 @@ class Engine:
         if self._bg: return True
         self._bg = True
         def _loop():
-            # TEMPO CIRURGICO: verifica a cada 0.35s, nao de 2 em 2s.
+            # TEMPO CIRURGICO MILISSEGUNDOS: verifica a cada 0.12s, nao de 2 em 2s.
             # Cada preco novo da Bybit ja verifica alvo / trava e fecha logo.
             # PAPEL = REAL: a mesma velocidade nos dois modos.
             while self._bg:
@@ -365,7 +365,7 @@ class Engine:
                         if b is not None: self.real_balance = b
                     self.tick()
                 except Exception: pass
-                time.sleep(0.35)
+                time.sleep(0.12)
         self._bg_thread = threading.Thread(target=_loop, daemon=True); self._bg_thread.start(); return True
 
 engine = Engine(cfg)
@@ -469,7 +469,7 @@ function ordHtml(o){return '<div class="ord"><b>'+shortNome(o)+'</b> • '+o.sta
 function carregar(){fetch('/api/status').then(function(r){return r.json();}).then(function(s){LAST=s;
 var tb=document.getElementById('toggleBtn');tb.innerText=s.is_running?'PARAR ROBÔ':'INICIAR ROBÔ';tb.className='btn '+(s.is_running?'btn-stop':'btn-start');
 document.getElementById('modeBadge').innerText=s.paper_trading?'PAPEL':'REAL';document.getElementById('modeBadge').className='badge '+(s.paper_trading?'badge-paper':'badge-real');
-document.getElementById('upd').innerText='Atualizado: '+new Date().toLocaleTimeString()+' | Fonte: Bybit'+(s.has_keys?' | Ligado à Bybit (Conta REAL)':' | Sem chaves - virtual');
+var _d=new Date();var _ms=('00'+_d.getMilliseconds()).slice(-3);document.getElementById('upd').innerText='Atualizado: '+_d.toLocaleTimeString()+'.'+_ms+' | Fonte: Bybit'+(s.has_keys?' | Ligado à Bybit (Conta REAL)':' | Sem chaves - virtual');
 document.getElementById('st').innerText=s.is_running?(s.aguardando_entrada?'A ANALISAR - A AGUARDAR TERRENO LIMPO':'A OPERAR'):'PARADO';
 document.getElementById('stline').innerText='Par: '+(s.active_symbol||'BTC/USDT:USDT')+' | Preco Bybit: '+(s.last_price||'--')+' | Ref: '+(s.reference_price||'-- (ainda nao entrou)')+' | Modo: '+(s.paper_trading?'PAPEL (simulacao REAL)':'REAL - Bybit');
 var pill=document.getElementById('terrenoPill');pill.innerText=s.terreno||'A ANALISAR';pill.className='pill '+(s.terreno==='LIMPO'?'pill-limpo':((s.terreno==='SOBRECOMPRADO'||s.terreno==='SOBREVENDIDO'||s.terreno==='FUGA')?'pill-sujo':'pill-an'));
@@ -483,7 +483,7 @@ document.getElementById('tot').innerText=fmt(s.live_total||0);
 document.getElementById('cofre').innerText='Cofre ciclo: '+Number(s.cofre||0).toFixed(4)+' | Cofre global: '+Number(s.cofre_global||0).toFixed(4);
 document.getElementById('emuso').innerText='Saldo da operacao: '+(s.saldo_operacao||1000)+' USDT | Em uso: '+Number((s.margin_per_order||30)*(s.live_orders||[]).length).toFixed(2)+' / '+(s.saldo_operacao||1000)+' USDT';
 document.getElementById('gridPill').innerText='Ref: '+(s.reference_price||'--')+' • Preço: '+(s.last_price||'--');
-document.getElementById('gridNota').innerText='Trava rigida: arma a +0.002 liquido, segue o melhor, recuo 0. 1 tick contra fecha. Taxa: abertura ao abrir, fecho so ao fechar.';
+document.getElementById('gridNota').innerText='Trava rigida MILISSEGUNDOS: arma a +0.002 liquido, segue o melhor, recuo 0. Mal recua 1 tick, fecha logo. Taxa: abertura ao abrir, fecho so ao fechar.';
 var shorts=(s.orders||[]).filter(function(o){return o.side==='sell';});var longs=(s.orders||[]).filter(function(o){return o.side==='buy';});
 var liveMap={};(s.live_orders||[]).forEach(function(o){liveMap[o.id]=o;});
 function withLive(o){var l=liveMap[o.id];if(l){o.pnl_live=l.pnl_live;o.falta_pct=l.falta_pct;}else{o.pnl_live=0;o.falta_pct=100;}return o;}
@@ -504,7 +504,7 @@ document.getElementById('hN').innerText=h.length+' ordens';
 document.getElementById('hlist').innerHTML=h.length?h.slice(-50).reverse().map(function(x){return '<div class="hist-item"><b>'+x.side+'</b> | '+(x.open_hhmm||'--:--')+' → '+(x.close_hhmm||'--:--')+' | <b>'+fmt(x.profit)+' USDT</b></div>';}).join(''):'Sem ordens fechadas neste dia.';
 if(document.getElementById('pg-merc').classList.contains('active'))desenhar(s);
 }).catch(function(){document.getElementById('upd').innerText='Sem ligacao ao servidor - verifica o Render.';});}
-carregar();setInterval(carregar,2000);
+carregar();setInterval(carregar,300);
 </script></body></html>"""
 
 @app.route("/")
@@ -515,9 +515,9 @@ def health():
     return jsonify({"status": "ok"})
 @app.route("/api/status")
 def status():
-    # O loop cirurgico (0.35s) ja atualiza o preco. Aqui so atualiza se estiver parado ha +1s.
+    # O loop cirurgico (0.12s) ja atualiza o preco. Aqui so atualiza se estiver parado ha +0.2s.
     try:
-        if time.time() - engine.last_tick_time > 1.0:
+        if time.time() - engine.last_tick_time > 0.2:
             engine.tick()
     except Exception: pass
     with engine.lock:
