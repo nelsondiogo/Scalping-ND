@@ -106,10 +106,7 @@ cfg = Cfg()
 
 _PRICE_CACHE = {"price": 0.0, "time": 0.0}
 def fetch_price():
-    # Rapido + a prova de falha: timeout curto, varias fontes, usa cache se tudo falhar.
-    # Antes: timeout 5s x 4 fontes = ate 20s por tick -> price_history nunca enchia, preco ficava -- e o bot nunca arrancava.
     c = COINS.get(cfg.coin, COINS["BTC"])
-    # CoinGecko id por moeda
     _gecko = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "BNB": "binancecoin", "XRP": "ripple", "ADA": "cardano"}.get(cfg.coin, "bitcoin")
     tries = [
         (f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={c['bybit']}", "bybit"),
@@ -136,7 +133,6 @@ def fetch_price():
                     return p
         except Exception:
             continue
-    # Se todas falharem, devolve o ultimo preco valido (nao 0) para o bot nao ficar em -- para sempre
     if _PRICE_CACHE["price"] > 0:
         return _PRICE_CACHE["price"]
     return 0.0
@@ -397,7 +393,7 @@ def _drenar_fila_esp(self, price):
         return net
 
     def tick(self, price=None):
-        if price is None or price <= 0: price = fetch_price()
+        if price is None: price = fetch_price()
         if not price or price <= 0: return
         with self.lock:
             self.prev_price = self.last_price if self.last_price > 0 else price
@@ -453,19 +449,37 @@ def _drenar_fila_esp(self, price):
         def _loop():
             while self._bg:
                 try:
-                    # Busca o preco 1x e passa ao tick (antes o tick buscava de novo e podia demorar 20s)
-                    _p = fetch_price()
-                    if _p and _p > 0:
-                        self.tick(price=_p)
-                    if has_api_keys() and int(time.time()) % 30 == 0:
+                    if has_api_keys() and int(time.time()) % 15 == 0:
                         b = fetch_bybit_real_balance()
                         if b is not None: self.real_balance = b
+                    self.tick()
                 except Exception: pass
-                time.sleep(0.5)
+                time.sleep(0.12)
         self._bg_thread = threading.Thread(target=_loop, daemon=True); self._bg_thread.start(); return True
 
+
+# Reserva: se a classe Engine vier sem start_background_loop (ficheiro misturado no GitHub),
+# repoe o metodo aqui. Assim o arranque nunca mais da AttributeError.
+if not hasattr(Engine, "start_background_loop"):
+    def _start_background_loop_reserva(self):
+        if getattr(self, "_bg", False): return True
+        self._bg = True
+        def _loop():
+            while getattr(self, "_bg", False):
+                try:
+                    _pp = fetch_price()
+                    if _pp and _pp > 0: self.tick(price=_pp)
+                except Exception: pass
+                import time as _tm; _tm.sleep(0.5)
+        import threading as _th
+        self._bg_thread = _th.Thread(target=_loop, daemon=True); self._bg_thread.start(); return True
+    Engine.start_background_loop = _start_background_loop_reserva
+
 engine = Engine(cfg)
-engine.start_background_loop()
+try:
+    engine.start_background_loop()
+except Exception:
+    pass  # arranque nunca pode matar o deploy
 
 HTML = """<!DOCTYPE html><html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ND-Scalping</title><style>
