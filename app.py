@@ -219,6 +219,14 @@ class Engine:
 
     def start_bot(self):
         with self.lock:
+            # NO REAL: le o saldo total real da Bybit SO para mostrar.
+            # O saldo da operacao continua a ser o que defines nos Ajustes (ex 10).
+            # O robo nunca usa o saldo total para abrir ordens.
+            if has_api_keys():
+                b = fetch_bybit_real_balance()
+                if b is not None:
+                    self.real_balance = b
+                    self.cfg.saldo_total = round(float(b), 4)
             p = self.last_price or fetch_price() or 0.0
             if p <= 0:
                 self.cfg.status_message = "Sem preco Bybit - tenta outra vez"
@@ -258,8 +266,17 @@ class Engine:
                 for o in list(self.orders_state):
                     if o.get("status") == "ACTIVE":
                         self._close(o, self.last_price, "Paragem Manual")
-            # TOTAL so atualiza aqui, ao fechar a operacao: total += resultado da operacao (cofre do ciclo)
-            self.cfg.saldo_total = round(float(self.cfg.saldo_total) + float(self.cfg.cofre), 4)
+            # TOTAL so atualiza aqui, ao fechar a operacao.
+            # PAPEL: total += cofre do ciclo (o codigo simula a Bybit).
+            # REAL: total = saldo real que a Bybit ja atualizou (ela ja descontou taxas).
+            # Nos dois casos, o robo operou SO com o saldo da operacao.
+            if has_api_keys():
+                b = fetch_bybit_real_balance()
+                if b is not None:
+                    self.real_balance = b
+                    self.cfg.saldo_total = round(float(b), 4)
+            else:
+                self.cfg.saldo_total = round(float(self.cfg.saldo_total) + float(self.cfg.cofre), 4)
             self.cfg.cofre = 0.0
             self.cfg.is_running = False
             self.aguardando_entrada = False
@@ -336,15 +353,19 @@ class Engine:
         if self._bg: return True
         self._bg = True
         def _loop():
+            # TEMPO CIRURGICO: verifica a cada 0.35s, nao de 2 em 2s.
+            # Cada preco novo da Bybit ja verifica alvo / trava e fecha logo.
+            # PAPEL = REAL: a mesma velocidade nos dois modos.
             while self._bg:
                 try:
-                    # Se ha chaves, busca saldo real de vez em quando
+                    # No REAL, busca saldo total real de vez em quando (so para mostrar).
+                    # O robo NUNCA opera com ele - opera SO com o saldo da operacao.
                     if has_api_keys() and int(time.time()) % 15 == 0:
                         b = fetch_bybit_real_balance()
                         if b is not None: self.real_balance = b
                     self.tick()
                 except Exception: pass
-                time.sleep(2)
+                time.sleep(0.35)
         self._bg_thread = threading.Thread(target=_loop, daemon=True); self._bg_thread.start(); return True
 
 engine = Engine(cfg)
@@ -407,7 +428,7 @@ canvas{width:100%;height:220px;background:#0b1220;border:1px solid #1e293b;borde
 <label>Moeda</label><select id="fCoin" onchange="mudarMoeda()"><option value="BTC">BTC / USDT</option><option value="ETH">ETH / USDT</option><option value="SOL">SOL / USDT</option><option value="BNB">BNB / USDT</option><option value="XRP">XRP / USDT</option><option value="ADA">ADA / USDT</option></select>
 <div class="muted" id="moedaInfo">Moeda atual: BTC - fonte: Bybit</div>
 <label>Saldo da conta (fixo no codigo)</label><input type="text" value="10000 USDT" readonly>
-<label>Saldo da operacao (USDT) - teto, defines tu</label><input id="fSaldoOp" type="number" value="1000">
+<label>Saldo da operacao (USDT) - teto no PAPEL e no REAL, defines tu</label><input id="fSaldoOp" type="number" value="1000">
 <div class="muted">Ex: conta 10000, operacao 1000. Lucros e perdas mexem aqui. Total so atualiza ao fechar.</div>
 <label>Margem por ordem (USDT) - diferente do saldo da operacao</label><input id="fMarg" type="number" value="30">
 <label>Alavancagem (1 a 20)</label><input id="fLev" type="number" value="15">
@@ -494,7 +515,10 @@ def health():
     return jsonify({"status": "ok"})
 @app.route("/api/status")
 def status():
-    try: engine.tick()
+    # O loop cirurgico (0.35s) ja atualiza o preco. Aqui so atualiza se estiver parado ha +1s.
+    try:
+        if time.time() - engine.last_tick_time > 1.0:
+            engine.tick()
     except Exception: pass
     with engine.lock:
         live_orders = []; live_total = 0.0
