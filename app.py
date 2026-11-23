@@ -39,7 +39,7 @@ def new_order(side, entry, kind, target=None):
     margin=float(CFG["margin"]); lev=float(CFG["leverage"]); qty=(margin*lev/entry) if entry>0 else 0
     return {"id":int(time.time()*1000)+random.randint(0,9999),"side":side,"kind":kind,"entry":round(float(entry),1),
             "target":round(float(target),1),"qty":qty,"status":"PENDING","activation":None,"best":None,
-            "trava_armed":False,"created":time.time(),"margin":margin,"guard_of":None,"open_fee":0.0}
+            "trava_armed":False,"created":time.time(),"margin":margin,"guard_of":None,"open_fee":0.0,"display":""}
 def close_order(o, close_price, reason):
     n=net_of(o, close_price)
     # Taxa de fecho so agora. Taxa de abertura ja foi contada ao ativar.
@@ -80,7 +80,7 @@ def spawn_guardian(active):
         g=new_order("SHORT", act-10, "GUARDIA"); g["guard_of"]=active["id"]; STATE["orders"].append(g)
 def is_clean():
     pr=STATE["prices"]
-    if len(pr)<30: return False
+    if len(pr)<20: return False
     amp=(max(pr[-60:])-min(pr[-60:])) if len(pr)>=60 else (max(pr)-min(pr))
     # Terreno limpo: amplitude <400 e perto da media <0.3%
     if STATE["mean"]>0 and abs(STATE["last_price"]-STATE["mean"])/STATE["mean"]>0.003: return False
@@ -106,11 +106,8 @@ def tick():
             o["open_fee"]=o["qty"]*o["entry"]*fee_rate()
     for o in list(STATE["orders"]):
         if o["status"]=="ACTIVE" and o["kind"] in ("NORMAL","ESP"): spawn_guardian(o)
-    # PENDING que nao ativa -> morre SO se preco fugir para o lado contrario 45
-    for o in list(STATE["orders"]):
-        if o["status"]!="PENDING": continue
-        if o["side"]=="LONG" and p < o["entry"]-45: STATE["orders"].remove(o)
-        if o["side"]=="SHORT" and p > o["entry"]+45: STATE["orders"].remove(o)
+    # PENDING que nao ativa -> NAO morre sozinha na abertura. So morre na reciclagem da pinca ou no rebase.
+    # (Antes matava 1 lado logo a abrir, porque a ordem ja nasce a 50 do preco e fugia 45)
     for o in list(STATE["orders"]):
         if o["status"]!="ACTIVE": continue
         moved=(p-o["entry"]) if o["side"]=="LONG" else (o["entry"]-p)
@@ -152,19 +149,19 @@ threading.Thread(target=loop, daemon=True).start()
 # ===== VISUAL ANTIGO - NAO MEXER =====
 TEMPLATE = r"""<!doctype html><html lang="pt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ND-SCALPING</title>
 <style>
-*{box-sizing:border-box}body{background:#0b1220;color:#e8eef5;font-family:system-ui,Arial,sans-serif;margin:0;padding:0;padding-bottom:80px}
-.top{padding:14px 14px 6px}h1{margin:0;font-size:24px;color:#22c55e}h1 span{background:#f59e0b;color:#000;font-size:14px;padding:4px 12px;border-radius:20px;margin-left:6px}
-.sub{color:#94a3b8;font-size:13px;margin-top:4px}.card{background:#16202e;border-radius:16px;padding:16px;margin:12px 14px}.card h2{color:#38bdf8;font-size:15px;letter-spacing:1px;margin:0 0 10px}
-.big{font-size:28px;font-weight:800}.green{color:#22c55e}.red{color:#ef4444}.small{color:#94a3b8;font-size:13px}
+*{box-sizing:border-box}body{background:#0b1220;color:#e8eef5;font-family:system-ui,Arial,sans-serif;margin:0;padding:0;padding-bottom:58px}
+.top{padding:8px 10px 2px}h1{margin:0;font-size:19px;color:#22c55e}h1 span{background:#f59e0b;color:#000;font-size:14px;padding:4px 12px;border-radius:20px;margin-left:6px}
+.sub{color:#94a3b8;font-size:11px;margin-top:4px}.card{background:#16202e;border-radius:10px;padding:10px;margin:8px 10px}.card h2{color:#38bdf8;font-size:12px;letter-spacing:1px;margin:0 0 10px}
+.big{font-size:19px;font-weight:800}.green{color:#22c55e}.red{color:#ef4444}.small{color:#94a3b8;font-size:13px}
 .pill-limpo{background:#14532d;color:#fff;padding:6px 14px;border-radius:20px;display:inline-block;font-weight:700;font-size:14px}
-.refpill{background:#facc15;color:#000;text-align:center;padding:10px;border-radius:20px;font-weight:800;font-size:16px}
-.grid2{display:flex;gap:0;margin-top:12px;border-radius:12px;overflow:hidden}.col{flex:1;padding:12px}.colS{background:#3a1212}.colL{background:#123324}.mid{width:6px;background:#facc15;position:relative}.mid b{position:absolute;top:50%;left:-6px;background:#facc15;color:#000;font-size:10px;padding:4px 2px;writing-mode:vertical-rl}
-.ord{border-bottom:1px solid rgba(255,255,255,.12);padding:10px 0}.ord:last-child{border:0}
-input,select{width:100%;padding:14px;border-radius:12px;border:0;background:#0b1220;color:#fff;font-size:16px;margin:6px 0 14px}label{color:#38bdf8;font-weight:700;font-size:13px;letter-spacing:.5px}
-button{width:100%;padding:14px;border:0;border-radius:12px;font-weight:800;font-size:16px;cursor:pointer;margin:6px 0}.btn-blue{background:#2563eb;color:#fff}.btn-green{background:#22c55e;color:#000}.btn-red{background:#dc2626;color:#fff}
-.bottom{position:fixed;bottom:0;left:0;right:0;background:#0b1220;padding:10px;display:flex;gap:8px;justify-content:center}.bottom button{width:auto;padding:12px 18px;border-radius:20px;background:#16202e;color:#94a3b8}.bottom button.on{background:#22c55e;color:#000}
-canvas{width:100%;height:220px;background:#0b1220;border-radius:12px}
-.histcard{background:#0b1220;border-radius:12px;padding:12px;margin:8px 0;font-weight:700}
+.refpill{background:#facc15;color:#000;text-align:center;padding:6px;border-radius:16px;font-weight:800;font-size:13px}
+.grid2{display:flex;gap:0;margin-top:8px;border-radius:12px;overflow:hidden}.col{flex:1;padding:8px}.colS{background:#3a1212}.colL{background:#123324}.mid{width:6px;background:#facc15;position:relative}.mid b{position:absolute;top:50%;left:-6px;background:#facc15;color:#000;font-size:10px;padding:4px 2px;writing-mode:vertical-rl}
+.ord{border-bottom:1px solid rgba(255,255,255,.12);padding:6px 0;font-size:13px;line-height:1.35}.ord:last-child{border:0}
+input,select{width:100%;padding:9px;border-radius:12px;border:0;background:#0b1220;color:#fff;font-size:16px;margin:6px 0 14px}label{color:#38bdf8;font-weight:700;font-size:11px;letter-spacing:.5px}
+button{width:100%;padding:10px;border:0;border-radius:12px;font-weight:800;font-size:16px;cursor:pointer;margin:6px 0}.btn-blue{background:#2563eb;color:#fff}.btn-green{background:#22c55e;color:#000}.btn-red{background:#dc2626;color:#fff}
+.bottom{position:fixed;bottom:0;left:0;right:0;background:#0b1220;padding:6px;display:flex;gap:8px;justify-content:center}.bottom button{width:auto;padding:8px 12px;font-size:12px;border-radius:20px;background:#16202e;color:#94a3b8}.bottom button.on{background:#22c55e;color:#000}
+canvas{width:100%;height:150px;background:#0b1220;border-radius:12px}
+.histcard{background:#0b1220;border-radius:8px;padding:8px;font-size:13px;margin:8px 0;font-weight:700}
 .hidden{display:none}
 </style></head><body>
 <div class="top"><h1>ND-SCALPING <span>PAPEL</span></h1><div class="sub" id="topsub">Atualizado: -- | Fonte: Bybit | Sem chaves - virtual</div></div>
@@ -196,27 +193,27 @@ canvas{width:100%;height:220px;background:#0b1220;border-radius:12px}
 <script>
 function tab(n){['dashboard','mercado','historico','ajustes'].forEach(t=>{document.getElementById('tab-'+t).classList.toggle('hidden',t!==n);document.getElementById('b-'+(t=='dashboard'?'dash':t=='mercado'?'merc':t=='historico'?'hist':'ajus')).classList.toggle('on',t===n);}); if(n=='mercado') draw();}
 let lastData=null;
-function draw(){if(!lastData) return; let c=document.getElementById('chart'); let ctx=c.getContext('2d'); ctx.clearRect(0,0,340,220); let pr=lastData.prices||[]; if(pr.length<2) return; let mn=Math.min(...pr,lastData.ref), mx=Math.max(...pr,lastData.ref); if(mx==mn) mx=mn+1; ctx.strokeStyle='#38bdf8'; ctx.beginPath(); pr.forEach((v,i)=>{let x=i/(pr.length-1)*340; let y=220-(v-mn)/(mx-mn)*200-10; if(i==0) ctx.moveTo(x,y); else ctx.lineTo(x,y);}); ctx.stroke(); ctx.strokeStyle='#facc15'; ctx.setLineDash([5,5]); let yr=220-(lastData.ref-mn)/(mx-mn)*200-10; ctx.beginPath(); ctx.moveTo(0,yr); ctx.lineTo(340,yr); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle='#facc15'; ctx.fillText('Ref '+lastData.ref,5,yr-4); lastData.orders.forEach(o=>{ctx.fillStyle=o.side=='LONG'?'#22c55e':'#ef4444'; let y=220-(o.entry-mn)/(mx-mn)*200-10; ctx.beginPath(); ctx.arc(330,y,4,0,7); ctx.fill();});}
+function draw(){if(!lastData) return; let c=document.getElementById('chart'); let ctx=c.getContext('2d'); ctx.clearRect(0,0,340,220); let pr=lastData.prices||[]; if(pr.length<2) return; let mn=Math.min(...pr), mx=Math.max(...pr); if(lastData.ref>0){mn=Math.min(mn,lastData.ref); mx=Math.max(mx,lastData.ref);} if(mx==mn) mx=mn+1; ctx.strokeStyle='#38bdf8'; ctx.beginPath(); pr.forEach((v,i)=>{let x=i/(pr.length-1)*340; let y=220-(v-mn)/(mx-mn)*200-10; if(i==0) ctx.moveTo(x,y); else ctx.lineTo(x,y);}); ctx.stroke(); if(lastData.ref>0){ctx.strokeStyle='#facc15'; ctx.setLineDash([5,5]); let yr=220-(lastData.ref-mn)/(mx-mn)*200-10; ctx.beginPath(); ctx.moveTo(0,yr); ctx.lineTo(340,yr); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle='#facc15'; if(lastData.ref>0) ctx.fillText('Ref '+lastData.ref,5,yr-4); lastData.orders.forEach(o=>{ctx.fillStyle=o.side=='LONG'?'#22c55e':'#ef4444'; let y=220-(o.entry-mn)/(mx-mn)*200-10; ctx.beginPath(); ctx.arc(330,y,4,0,7); ctx.fill();});}
 async function load(){let r=await fetch('/api/status');let d=await r.json(); lastData=d;
 let now=new Date(); document.getElementById('topsub').innerText='Atualizado: '+now.toLocaleTimeString()+'.'+String(now.getMilliseconds()).padStart(3,'0')+' | Fonte: Bybit | Sem chaves - virtual';
 document.getElementById('operar').innerText=d.is_running?'A OPERAR':'PARADO';
-document.getElementById('parline').innerText='Par: BTC/USDT:USDT | Preco Bybit: '+d.last_price+' | Ref: '+d.ref+' | Modo: PAPEL (simulacao REAL)';
+document.getElementById('parline').innerText='Par: BTC/USDT:USDT | Preco Bybit: '+d.last_price+' | Ref: '+(d.ref>0?d.ref:'--')+' | Modo: PAPEL (simulacao REAL)';
 document.getElementById('terrain').innerText=d.terrain||'LIMPO';
-document.getElementById('terrainTxt').innerText='Preco '+d.last_price+' perto da media '+d.mean+' ('+d.meanDiff+'%). Terreno limpo - pode entrar.';
+document.getElementById('terrainTxt').innerText=d.ref>0?('Preco '+d.last_price+' perto da media '+d.mean+' ('+d.meanDiff+'%). Terreno limpo - pode entrar.'):'A ler Bybit 60-120s em terreno limpo... ainda sem entrada. Ref fica -- ate abrir as 2 ordens juntas.';
 document.getElementById('total').innerText=(10000+d.cofre_global+d.live_total).toFixed(2)+' USDT';
 document.getElementById('opBal').innerText=(d.op_balance+d.cofre+d.live_total).toFixed(2)+' USDT';
 document.getElementById('opInfo').innerText='Inicio: '+d.op_balance+' | Lucros/perdas mexem aqui';
-document.getElementById('posline').innerText='Preco Bybit: '+d.last_price+' | Ref: '+d.ref+' | Entrada escolhida pelo robo: '+d.entry_ref;
+document.getElementById('posline').innerText='Preco Bybit: '+d.last_price+' | Ref: '+(d.ref>0?d.ref:'--')+' | Entrada escolhida pelo robo: '+(d.entry_ref>0?d.entry_ref:'--');
 let v=document.getElementById('vivo'); v.innerText=d.live_total; v.style.color=d.live_total>=0?'#22c55e':'#ef4444';
 document.getElementById('cofre').innerText='Cofre ciclo: '+d.cofre+' | Cofre global: '+d.cofre_global;
 document.getElementById('emuso').innerText='Saldo da operacao: '+d.op_balance+' USDT | Em uso: '+d.emuso.toFixed(2)+' / '+d.op_balance+' USDT';
-document.getElementById('refpill').innerText='Ref: '+d.ref+' • Preço: '+d.last_price;
+document.getElementById('refpill').innerText=(d.ref>0?'Ref: '+d.ref+' • Preço: '+d.last_price:'A ANALISAR — a ler Bybit... • Preço: '+d.last_price);
 function sort(arr){return arr.sort((a,b)=>{let ra=a.status=='ACTIVE'?0:1, rb=b.status=='ACTIVE'?0:1; if(ra!=rb) return ra-rb; return Math.abs(a.entry-d.last_price)-Math.abs(b.entry-d.last_price);});}
 let shorts=sort(d.orders.filter(o=>o.side=='SHORT')); let longs=sort(d.orders.filter(o=>o.side=='LONG'));
 document.getElementById('colShort').innerHTML='<b style="color:#f87171">▼ SHORT — ABAIXO DA REF</b>'+shorts.map(o=>'<div class="ord"><b>'+o.kind+' '+o.side+' • '+o.status+'</b><br>'+o.entry+' → '+o.target+' • <span style="color:'+(o.pnl>=0?'#22c55e':'#ef4444')+'">'+o.pnl+'</span><br><span class="small">Falta <b>'+o.falta+'%</b> para o alvo</span></div>').join('');
 document.getElementById('colLong').innerHTML='<b style="color:#4ade80">▲ LONG — ACIMA DA REF</b>'+longs.map(o=>'<div class="ord"><b>'+o.kind+' '+o.side+' • '+o.status+'</b><br>'+o.entry+' → '+o.target+' • <span style="color:'+(o.pnl>=0?'#22c55e':'#ef4444')+'">'+o.pnl+'</span><br><span class="small">Falta <b>'+o.falta+'%</b> para o alvo</span></div>').join('');
 document.getElementById('counts').innerText=d.orders.filter(o=>o.status=='ACTIVE').length+' ativas | '+d.orders.filter(o=>o.status=='PENDING').length+' a espera | '+d.history.length+' fechadas';
-document.getElementById('mercadoLine').innerText='Preco Bybit: '+d.last_price+' | Ref: '+d.ref+' | Moeda: BTC';
+document.getElementById('mercadoLine').innerText='Preco Bybit: '+d.last_price+' | Ref: '+(d.ref>0?d.ref:'--')+' | Moeda: BTC';
 document.getElementById('traj').innerText='Trajetoria Bybit: '+d.traj+' | Terreno: '+(d.terrain||'LIMPO');
 let filtro=document.getElementById('filtroData').value; let hist=d.history; if(filtro){hist=hist.filter(h=>{let dt=new Date(h.t_close*1000); return dt.toISOString().slice(0,10)==filtro;});}
 let tot=hist.reduce((s,h)=>s+h.net,0); let lTot=hist.filter(h=>h.side=='LONG').reduce((s,h)=>s+h.net,0); let sTot=hist.filter(h=>h.side=='SHORT').reduce((s,h)=>s+h.net,0); let lN=hist.filter(h=>h.side=='LONG').length; let sN=hist.filter(h=>h.side=='SHORT').length;
@@ -242,6 +239,10 @@ def status():
     if p<=0: p=STATE["last_price"]
     orders=[]; live=0; emuso=0
     for o in STATE["orders"]:
+        # NOME CORRETO: NORMAL -> "SHORT • PENDING" / "LONG • ACTIVE". ESP -> "ESP SHORT • PENDING". GUARDIA -> "GUARDIA LONG • PENDING"
+        if o["kind"]=="ESP": o["display"]=f"ESP {o['side']} • {o['status']}"
+        elif o["kind"]=="GUARDIA": o["display"]=f"GUARDIA {o['side']} • {o['status']}"
+        else: o["display"]=f"{o['side']} • {o['status']}"
         # CORRECAO: PENDING = 0.0000, sem PnL, sem taxa. So ACTIVE tem PnL.
         if o["status"]=="PENDING": pnl=0.0
         else: pnl=round((p-o["entry"])*o["qty"] if o["side"]=="LONG" else (o["entry"]-p)*o["qty"],4)
