@@ -1,532 +1,244 @@
-# ND-SCALPING V6 - app.py PERSONALIZADO FINAL + REBALANCEAMENTO
-import os, time, threading, json, urllib.request, urllib.parse, hmac, hashlib
-from datetime import datetime, timezone
-from flask import Flask, request, jsonify, render_template_string
+
+import time, threading, json, os, random
+from flask import Flask, jsonify, request, render_template_string
 app = Flask(__name__)
-PAPER_INITIAL_BALANCE = 10000.0
-FEE_TAKER = 0.00055
-TRAVA_LIQUIDO = 0.002
-MAX_ABERTAS = 9999
-COINS = {
-    "BTC": {"pair": "BTC/USDT:USDT", "bybit": "BTCUSDT", "binance": "BTCUSDT", "kraken": "XBTUSD", "bitstamp": "btcusd", "step": 90.0},
-    "ETH": {"pair": "ETH/USDT:USDT", "bybit": "ETHUSDT", "binance": "ETHUSDT", "kraken": "ETHUSD", "bitstamp": "ethusd", "step": 3.0},
-    "SOL": {"pair": "SOL/USDT:USDT", "bybit": "SOLUSDT", "binance": "SOLUSDT", "kraken": "SOLUSD", "bitstamp": "solusd", "step": 0.30},
-    "BNB": {"pair": "BNB/USDT:USDT", "bybit": "BNBUSDT", "binance": "BNBUSDT", "kraken": "BNBUSD", "bitstamp": "bnbusd", "step": 2.0},
-    "XRP": {"pair": "XRP/USDT:USDT", "bybit": "XRPUSDT", "binance": "XRPUSDT", "kraken": "XRPUSD", "bitstamp": "xrpusd", "step": 0.02},
-    "ADA": {"pair": "ADA/USDT:USDT", "bybit": "ADAUSDT", "binance": "ADAUSDT", "kraken": "ADAUSD", "bitstamp": "adausd", "step": 0.02},
+# ============ CONFIG - OPERADOR ESCOLHE, SISTEMA NAO DECIDE PASSO ============
+# Passo vem dos Ajustes (cfg). Nao ha passo adaptativo, nao ha calculo por volatilidade.
+# Se operador nao puser passo, usa 80 como valor inicial exibido, mas sistema nunca muda.
+CFG = {
+ "total_balance": 10000.0, "op_balance": 1000.0, "margin": 100.0, "leverage": 15,
+ "passo": 80.0,  # ESCOLHA DO OPERADOR - fixo, nunca alterado pelo sistema
+ "is_running": False, "paper": True, "cofre": 0.0, "cofre_global": 0.0,
+ "cycle_start": 0.0, "entry_ref": 0.0,
 }
-TOP_PAIRS = [v["pair"] for v in COINS.values()]
-def has_api_keys():
-    return bool(os.getenv("BYBIT_API_KEY")) and bool(os.getenv("BYBIT_API_SECRET"))
-def fetch_bybit_real_balance():
-    try:
-        key = os.getenv("BYBIT_API_KEY"); sec = os.getenv("BYBIT_API_SECRET")
-        ts = str(int(time.time()*1000))
-        params = {"accountType": "UNIFIED", "coin": "USDT"}
-        qs = urllib.parse.urlencode(params)
-        sign_str = ts + key + "5000" + qs
-        sign = hmac.new(sec.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-        req = urllib.request.Request("https://api.bybit.com/v5/account/wallet-balance?" + qs, headers={"X-BAPI-API-KEY": key, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": "5000", "X-BAPI-SIGN": sign})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            d = json.loads(r.read().decode())
-            lst = d.get("result", {}).get("list", [])
-            if lst:
-                for c in lst[0].get("coin", []):
-                    if c.get("coin") == "USDT":
-                        return float(c.get("walletBalance") or c.get("equity") or 0)
-    except Exception:
-        return None
-    return None
-class Cfg:
-    def __init__(self):
-        self.paper_trading = not has_api_keys()
-        self.paper_initial_balance = PAPER_INITIAL_BALANCE
-        self.saldo_total = PAPER_INITIAL_BALANCE
-        self.coin = "BTC"
-        self.leverage = 15
-        self.margin_per_order = 30.0
-        self.saldo_operacao = 1000.0
-        self.grid_step_price = 80.0
-        self.total_orders = 14
-        self.lucro_por_operacao = 5.0
-        self.modo_operacao = "auto"
-        self.operacoes_por_dia = 10
-        self.selected_pair = COINS["BTC"]["pair"]
-        self.active_symbol = COINS["BTC"]["pair"]
-        self.is_running = False
-        self.cycle_initial_equity = PAPER_INITIAL_BALANCE
-        self.cofre = 0.0
-        self.cofre_global = 0.0
-        self.completed_operations = 0
-        self.max_auto_operations = 0
-        self.auto_mode = True
-        self.status_message = "A aguardar..."
-        self.fee_rate = FEE_TAKER
-        self.trailing_offset_pct = 0.0
-cfg = Cfg()
-def fetch_price():
-    c = COINS.get(cfg.coin, COINS["BTC"])
-    tries = [
-        (f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={c['bybit']}", "bybit"),
-        (f"https://api.binance.com/api/v3/ticker/price?symbol={c['binance']}", "binance"),
-        (f"https://api.kraken.com/0/public/Ticker?pair={c['kraken']}", "kraken"),
-        (f"https://www.bitstamp.net/api/v2/ticker/{c['bitstamp']}/", "bitstamp"),
-    ]
-    for url, kind in tries:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ND-Scalping"})
-            with urllib.request.urlopen(req, timeout=5) as r:
-                d = json.loads(r.read().decode())
-                if kind == "bybit": p = float(d["result"]["list"][0]["lastPrice"])
-                elif kind == "binance": p = float(d["price"])
-                elif kind == "kraken":
-                    k = list(d["result"].keys())[0]; p = float(d["result"][k]["c"][0])
-                else: p = float(d["last"])
-                if p > 0: return p
-        except Exception:
-            continue
-    return 0.0
-def hhmm(iso):
-    try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        h = (dt.hour + 1) % 24
-        return f"{h:02d}:{dt.minute:02d}"
-    except Exception:
-        return "--:--"
-class Engine:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        self.lock = threading.Lock()
-        self.reference_price = 0.0
-        self.orders_state = []
-        self.history = []
-        self.closed_orders = []
-        self.hist_long_pnl = 0.0
-        self.hist_short_pnl = 0.0
-        self.last_price = 0.0
-        self.prev_price = 0.0
-        self.last_tick_time = 0.0
-        self.paper_equity = PAPER_INITIAL_BALANCE
-        self.bloquear_novas = False
-        self.per_side = 7
-        self.grid_step = cfg.grid_step_price
-        self.first_dist = cfg.grid_step_price / 2
-        self.price_history = []
-        self.aguardando_entrada = False
-        self.terreno = "A ANALISAR"
-        self.analise_msg = "A aguardar inicio..."
-        self.entrada_preco = 0.0
-        self.operation_day = ""
-        self.real_balance = None
-        self._bg = False
-        self._bg_thread = None
-        self._reb_counter = 0
-        self._teto_bloqueado = False
-    def _gross(self, o, price):
-        e = float(o["entry_price"])
-        return (price - e) * o["qty"] if o["side"] == "buy" else (e - price) * o["qty"]
-    def _fee_open(self, o):
-        return FEE_TAKER * float(o["entry_price"]) * o["qty"]
-    def _fee_close(self, o, price):
-        return FEE_TAKER * price * o["qty"]
-    def _fee(self, o, price):
-        return self._fee_open(o) + self._fee_close(o, price)
-    def _net_live(self, o, price):
-        return self._gross(o, price) - self._fee_open(o)
-    def _net(self, o, price):
-        return self._gross(o, price) - self._fee(o, price)
-    def _falta_pct(self, o, price):
-        try:
-            e = float(o["entry_price"]); t = float(o["target"])
-            if o["side"] == "buy":
-                total = t - e
-                if total <= 0: return 0.0
-                falta = (t - price) / total * 100
-            else:
-                total = e - t
-                if total <= 0: return 0.0
-                falta = (price - t) / total * 100
-            return round(max(0.0, min(100.0, falta)), 1)
-        except Exception:
-            return 100.0
-    def analisar_terreno(self):
-        h = list(self.price_history)
-        if len(h) < 10:
-            return ("A ANALISAR", "A recolher preco da Bybit... aguarda uns segundos.")
-        cur = h[-1]
-        janela = h[-60:]
-        media = sum(janela) / len(janela)
-        dist_pct = (cur - media) / media if media else 0
-        vel_pct = 0.0
-        if len(h) >= 15:
-            vel_pct = (cur - h[-15]) / h[-15] if h[-15] else 0
-        if dist_pct > 0.001:
-            return ("SOBRECOMPRADO", f"Preco {cur:.2f} muito acima da media {media:.2f} (+{dist_pct*100:.2f}%). Zona de sobrecompra - nao entra.")
-        if dist_pct < -0.001:
-            return ("SOBREVENDIDO", f"Preco {cur:.2f} muito abaixo da media {media:.2f} ({dist_pct*100:.2f}%). Zona de sobrevenda - nao entra.")
-        if abs(vel_pct) > 0.0008:
-            return ("FUGA", f"Preco a fugir {vel_pct*100:.2f}% em 30s. Zona de fuga - nao entra.")
-        return ("LIMPO", f"Preco {cur:.2f} perto da media {media:.2f} ({dist_pct*100:.2f}%). Terreno limpo - pode entrar.")
-    def build_grid(self, ref):
-        orders = []
-        half = max(1, int(self.cfg.total_orders) // 2)
-        self.per_side = half
-        step = float(self.cfg.grid_step_price)
-        self.grid_step = step; self.first_dist = step / 2
-        lev = float(self.cfg.leverage)
-        for i in range(1, half + 1):
-            e_long = ref + step/2 + (i-1)*step
-            q_long = round(float(self.cfg.margin_per_order) * float(lev) / e_long, 8)
-            orders.append({"id": f"LONG_{i}", "side": "buy", "entry_price": round(e_long, 4), "entry": round(e_long, 4), "target": round(e_long + step, 4), "qty": q_long, "lev": lev, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
-            e_short = ref - step/2 - (i-1)*step
-            q_short = round(float(self.cfg.margin_per_order) * float(lev) / e_short, 8)
-            orders.append({"id": f"SHORT_{i}", "side": "sell", "entry_price": round(e_short, 4), "entry": round(e_short, 4), "target": round(e_short - step, 4), "qty": q_short, "lev": lev, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
-        return orders
-    def start_bot(self):
-        with self.lock:
-            if has_api_keys():
-                b = fetch_bybit_real_balance()
-                if b is not None:
-                    self.real_balance = b
-                    self.cfg.saldo_total = round(float(b), 4)
-            p = self.last_price or fetch_price() or 0.0
-            if p <= 0:
-                self.cfg.status_message = "Sem preco Bybit - tenta outra vez"
-                return {"status": "error", "error": "sem preco"}
-            self.cfg.is_running = True
-            self.aguardando_entrada = True
-            self.reference_price = 0.0
-            self.orders_state = []
-            self.cfg.cofre = 0.0
-            self.cfg.status_message = "A ANALISAR - Bybit"
-            self.terreno, self.analise_msg = self.analisar_terreno()
-            return {"status": "analisando", "terreno": self.terreno, "msg": self.analise_msg}
-    def _tentar_entrar(self):
-        if not self.aguardando_entrada or not self.cfg.is_running: return
-        if self.last_price <= 0: return
-        self.terreno, self.analise_msg = self.analisar_terreno()
-        if self.terreno != "LIMPO": return
-        self.reference_price = self.last_price
-        self.entrada_preco = self.last_price
-        now = datetime.now(timezone.utc)
-        from datetime import timedelta
-        ld = now + timedelta(hours=1)
-        self.operation_day = ld.strftime("%Y-%m-%d")
-        self.cfg.cycle_initial_equity = self.cfg.saldo_total
-        self.orders_state = self.build_grid(self.last_price)
-        self.paper_equity = self.cfg.saldo_total
-        self.aguardando_entrada = False
-        self.cfg.status_message = "A OPERAR"
-    def stop_bot(self, close_all=True):
-        with self.lock:
-            if close_all and self.last_price > 0:
-                for o in list(self.orders_state):
-                    if o.get("status") == "ACTIVE":
-                        self._close(o, self.last_price, "Paragem Manual")
-            if has_api_keys():
-                b = fetch_bybit_real_balance()
-                if b is not None:
-                    self.real_balance = b
-                    self.cfg.saldo_total = round(float(b), 4)
-            else:
-                self.cfg.saldo_total = round(float(self.cfg.saldo_total) + float(self.cfg.cofre), 4)
-            self.cfg.cofre = 0.0
-            self.cfg.is_running = False
-            self.aguardando_entrada = False
-            self.cfg.status_message = "PARADO"
-            return {"status": "stopped", "saldo_total": self.cfg.saldo_total}
-    def switch_pair(self, pair):
-        for coin, info in COINS.items():
-            if info["pair"] == pair:
-                self.cfg.coin = coin; self.cfg.selected_pair = pair; self.cfg.active_symbol = pair
-                self.cfg.grid_step_price = info["step"]; self.grid_step = info["step"]; self.first_dist = info["step"]/2
-                return {"ok": True, "active": pair, "coin": coin, "step": info["step"]}
-        return {"ok": False}
+STATE = {"orders": [], "history": [], "prices": [], "last_price": 59250.0, "ref": 0.0, "guardian_for": {}}
+LOCK = threading.Lock()
+FEE_PAPER = 0.0001
+FEE_REAL = 0.00055
+def fee_rate(): return FEE_PAPER if CFG["paper"] else FEE_REAL
+def price_now():
+    # Papel: Bybit publico via simulacao leve - usa ultimo preco + random walk pequeno para teste
+    # Real: aqui entraria fetch Bybit. Mantem interface igual.
+    return STATE["last_price"]
+def net_of(o, close_price):
+    qty = o["qty"]; entry = o["entry"]
+    gross = (close_price-entry)*qty if o["side"]=="LONG" else (entry-close_price)*qty
+    fee = qty*entry*fee_rate() + qty*close_price*fee_rate()
+    return gross-fee
+def new_order(side, entry, kind, target=None):
+    passo = float(CFG["passo"])
+    if target is None:
+        target = entry+passo if side=="LONG" else entry-passo
+    margin = float(CFG["margin"]); lev = float(CFG["leverage"])
+    qty = (margin*lev/entry) if entry>0 else 0
+    return {"id": int(time.time()*1000)+random.randint(0,999), "side": side, "kind": kind,
+            "entry": round(float(entry),1), "target": round(float(target),1), "qty": qty,
+            "status": "PENDING", "activation": None, "best": None, "trava_armed": False,
+            "created": time.time(), "margin": margin}
+def close_order(o, close_price, reason):
+    n = net_of(o, close_price)
+    rec = {"side": o["side"], "kind": o["kind"], "open": o["entry"], "close": round(float(close_price),1),
+           "net": round(n,4), "reason": reason, "t_open": o["created"], "t_close": time.time()}
+    STATE["history"].append(rec)
+    CFG["cofre"] += n; CFG["cofre_global"] += n
+    STATE["orders"].remove(o)
+    return rec, n
+def spawn_pinca(close_price):
+    # Sempre 2 em simultaneo: SHORT a -25, LONG a +20 do fecho, PENDING, margem livre
+    s = new_order("SHORT", close_price-25, "NORMAL")
+    l = new_order("LONG", close_price+20, "NORMAL")
+    STATE["orders"].extend([s,l])
+    # Recicla PENDING longe: fecha PENDING NORMAL a mais de 160 do fecho (ordem original longe)
+    for o in list(STATE["orders"]):
+        if o["status"]=="PENDING" and o["kind"]=="NORMAL" and abs(o["entry"]-close_price)>160:
+            # nao toca na recem-nascida
+            if o not in (s,l):
+                STATE["orders"].remove(o)
+def spawn_esp(close_price, closed_side):
+    # Espelho: fecha LONG -> ESP SHORT a fecho-10 ; fecha SHORT -> ESP LONG a fecho+10, PENDING
+    if closed_side=="LONG":
+        STATE["orders"].append(new_order("SHORT", close_price-10, "ESP"))
+    else:
+        STATE["orders"].append(new_order("LONG", close_price+10, "ESP"))
+def spawn_guardian(active_order):
+    # So quando ACTIVE e avancou 10 do preco de ativacao. Nasce a 10 do preco de ativacao, lado oposto.
+    act = active_order["activation"]
+    if act is None: return
+    side = active_order["side"]
+    # verifica se ja existe guardiao para esta ordem
+    for o in STATE["orders"]:
+        if o.get("guard_of")==active_order["id"]: return
+    if side=="SHORT":
+        # preco desceu 10 -> guardiao LONG a ativacao+10
+        if STATE["last_price"] <= act-10:
+            g = new_order("LONG", act+10, "GUARDIA")
+            g["guard_of"]=active_order["id"]; STATE["orders"].append(g)
+    else:
+        if STATE["last_price"] >= act+10:
+            g = new_order("SHORT", act-10, "GUARDIA")
+            g["guard_of"]=active_order["id"]; STATE["orders"].append(g)
+def tick():
+    if not CFG["is_running"]: return
+    # simula preco: random walk  - em real substituir por fetch Bybit
+    STATE["last_price"] = round(STATE["last_price"] + random.uniform(-8,8),1)
+    p = STATE["last_price"]; STATE["prices"].append(p)
+    if len(STATE["prices"])>200: STATE["prices"].pop(0)
+    passo = float(CFG["passo"])
+    # entrada inicial: so 2
+    if not STATE["orders"] and not STATE["history"]:
+        ref = p; STATE["ref"]=ref; CFG["entry_ref"]=ref
+        STATE["orders"].extend([new_order("LONG", ref+passo, "NORMAL"), new_order("SHORT", ref-passo, "NORMAL")])
+        return
+    # ativacao PENDING
+    for o in list(STATE["orders"]):
+        if o["status"]!="PENDING": continue
+        if o["side"]=="LONG" and p>=o["entry"]:
+            o["status"]="ACTIVE"; o["activation"]=o["entry"]; o["best"]=o["entry"]
+        if o["side"]=="SHORT" and p<=o["entry"]:
+            o["status"]="ACTIVE"; o["activation"]=o["entry"]; o["best"]=o["entry"]
+    # guardiao
+    for o in list(STATE["orders"]):
+        if o["status"]=="ACTIVE" and o["kind"] in ("NORMAL","ESP"):
+            spawn_guardian(o)
+    # trava 60% + alvo
+    for o in list(STATE["orders"]):
+        if o["status"]!="ACTIVE": continue
+        dist = passo
+        moved = (p-o["entry"]) if o["side"]=="LONG" else (o["entry"]-p)
+        prog = moved/dist if dist>0 else 0
+        if prog>=0.6 and not o["trava_armed"]:
+            o["trava_armed"]=True; o["best"]=p
+        if o["trava_armed"]:
+            # segue melhor
+            if o["side"]=="LONG" and p>o["best"]: o["best"]=p
+            if o["side"]=="SHORT" and p<o["best"]: o["best"]=p
+            # recuo 1 tick (0.1) -> fecha por Trava a preco de mercado
+            recuo = (o["best"]-p) if o["side"]=="LONG" else (p-o["best"])
+            if recuo>=0.1:
+                # fecha por Trava: guardiao ativa MANTEM (reversao)
+                rec,_ = close_order(o, p, "Trava")
+                spawn_pinca(p); spawn_esp(p, o["side"])
+                break
+        # alvo: atinge ou passa -> fecha a preco de mercado, so se liquido>=0
+        hit = (p>=o["target"]) if o["side"]=="LONG" else (p<=o["target"])
+        if hit:
+            n = net_of(o, p)
+            if n>=0:
+                # fecha por Alvo: guardiao ativa fecha junto
+                guardians = [g for g in list(STATE["orders"]) if g.get("guard_of")==o["id"] and g["status"]=="ACTIVE"]
+                rec,_ = close_order(o, p, "Alvo")
+                for g in guardians:
+                    # fecha guardiao junto a preco de mercado
+                    close_order(g, p, "Alvo-Par")
+                spawn_pinca(p); spawn_esp(p, o["side"])
+                break
+    # limpeza PENDING velha longe: se PENDING NORMAL a mais de 200 do preco e com mais de 5 min, morre
+    for o in list(STATE["orders"]):
+        if o["status"]=="PENDING" and o["kind"]=="NORMAL" and abs(o["entry"]-p)>200 and time.time()-o["created"]>300:
+            STATE["orders"].remove(o)
+    # rebase 160: se preco fugiu 160 da ref e sem ACTIVE, nasce par novo
+    if STATE["ref"] and abs(p-STATE["ref"])>160 and not any(x["status"]=="ACTIVE" for x in STATE["orders"]):
+        STATE["ref"]=p; CFG["entry_ref"]=p
+        STATE["orders"].extend([new_order("LONG", p+passo, "NORMAL"), new_order("SHORT", p-passo, "NORMAL")])
 
-    def _passo_adaptativo(self):
+def loop():
+    while True:
         try:
-            h = list(self.price_history)
-            if len(h) < 10:
-                return float(self.cfg.grid_step_price)
-            amp = max(h) - min(h)
-            if amp < 200:
-                return 40.0
-            if amp <= 600:
-                return 80.0
-            return 150.0
-        except Exception:
-            return 80.0
-    def _grelha_movel(self, price):
-        # Grelha Movel Infinita: sempre 4 PENDING LONG acima e 4 SHORT abaixo do preco atual
-        try:
-            step = self._passo_adaptativo()
-            self.cfg.grid_step_price = step
-            self.grid_step = step
-            # Ref passa a ser o preco atual (sombra) - nao fixa
-            self.reference_price = float(price)
-            # Conta pendentes por lado
-            pend_long = [x for x in self.orders_state if x.get("status")=="PENDING" and x.get("side")=="buy"]
-            pend_short = [x for x in self.orders_state if x.get("status")=="PENDING" and x.get("side")=="sell"]
-            lev = float(self.cfg.leverage)
-            # Cria LONGs que faltam
-            for i in range(1, 5):
-                if len([x for x in pend_long if abs(float(x.get("entry_price",0)) - (price + step/2 + (i-1)*step)) < step*0.4])>0:
-                    continue
-                if len(pend_long) >= 4:
-                    break
-                e = round(float(price) + step/2 + (i-1)*step, 4)
-                q = round(float(self.cfg.margin_per_order) * float(lev) / e, 8) if e>0 else 0
-                nid = f"MOV_LONG_{int(time.time()*1000)%1000000}_{i}"
-                self.orders_state.append({"id": nid, "side": "buy", "entry_price": e, "entry": e, "target": round(e+step,4), "qty": q, "lev": lev, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
-                pend_long.append(self.orders_state[-1])
-            for i in range(1, 5):
-                if len([x for x in pend_short if abs(float(x.get("entry_price",0)) - (price - step/2 - (i-1)*step)) < step*0.4])>0:
-                    continue
-                if len(pend_short) >= 4:
-                    break
-                e = round(float(price) - step/2 - (i-1)*step, 4)
-                q = round(float(self.cfg.margin_per_order) * float(lev) / e, 8) if e>0 else 0
-                nid = f"MOV_SHORT_{int(time.time()*1000)%1000000}_{i}"
-                self.orders_state.append({"id": nid, "side": "sell", "entry_price": e, "entry": e, "target": round(e-step,4), "qty": q, "lev": lev, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
-                pend_short.append(self.orders_state[-1])
-            # Limpa PENDINGs muito longe (> 5 passos) - nao deixam lixo
-            keep=[]
-            for x in list(self.orders_state):
-                if x.get("status")=="PENDING" and abs(float(x.get("entry_price",0))-float(price)) > step*5:
-                    continue
-                keep.append(x)
-            self.orders_state = keep
-        except Exception:
-            pass
-    def _compensacao(self, price):
-        # Fecho por compensacao: lucros novos pagam a velha mais perdedora, neto ~0
-        try:
-            act = [x for x in list(self.orders_state) if x.get("status")=="ACTIVE"]
-            if len(act) < 2:
-                return
-            nets = [(o, self._net(o, price)) for o in act]
-            worst, worst_net = min(nets, key=lambda t: t[1])
-            # So compensa se a velha esta mesmo funda: -1% do saldo ou -1 USDT
-            lim = max(1.0, float(self.cfg.saldo_operacao)*0.01)
-            if worst_net > -lim:
-                return
-            winners = [(o,n) for o,n in nets if n > 0.05 and o is not worst]
-            if not winners:
-                return
-            winners_sorted = sorted(winners, key=lambda t: t[1], reverse=True)
-            soma = 0.0
-            usar=[]
-            for o,n in winners_sorted:
-                usar.append((o,n)); soma += n
-                if soma + worst_net >= -0.05:
-                    break
-            if soma + worst_net < -0.05:
-                return
-            # Fecha vencedoras primeiro, depois a velha - neto fica ~0 no cofre
-            for o,n in usar:
-                if o.get("status")=="ACTIVE":
-                    self._close(o, price, "COMPENSACAO")
-            if worst.get("status")=="ACTIVE":
-                self._close(worst, price, "COMPENSACAO")
-        except Exception:
-            pass
-    def _rebalance(self, close_price, closed_side, mirror_side, mirror_id):
-        try:
-            step = float(self.cfg.grid_step_price)
-            lev = float(self.cfg.leverage)
-            cands = [x for x in list(self.orders_state) if x.get("status") == "PENDING" and x.get("side") == mirror_side and x.get("id") != mirror_id]
-            if not cands:
-                return
-            normals = [x for x in cands if not str(x.get("id", "")).startswith("ESP")]
-            pool = normals if normals else cands
-            victim = max(pool, key=lambda x: abs(float(x.get("entry_price", 0)) - float(close_price)))
-            self.orders_state = [x for x in self.orders_state if x.get("id") != victim.get("id")]
-            self._reb_counter += 1
-            if closed_side == "buy":
-                e_new = round(float(close_price) + step/2, 4)
-                tgt_new = round(e_new + step, 4)
-                nid = f"LONG_REB_{self._reb_counter}"
-            else:
-                e_new = round(float(close_price) - step/2, 4)
-                tgt_new = round(e_new - step, 4)
-                nid = f"SHORT_REB_{self._reb_counter}"
-            q_new = round(float(self.cfg.margin_per_order) * float(lev) / e_new, 8) if e_new > 0 else 0
-            self.orders_state.append({"id": nid, "side": closed_side, "entry_price": e_new, "entry": e_new, "target": tgt_new, "qty": q_new, "lev": lev, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False, "ref": round(float(close_price), 4)})
-        except Exception:
-            pass
-    def _close(self, o, price, reason):
-        gross = self._gross(o, price)
-        fee_open = self._fee_open(o); fee_close = self._fee_close(o, price)
-        fee = fee_open + fee_close; net = gross - fee
-        o["status"] = "CLOSED"
-        now_iso = datetime.now(timezone.utc).isoformat()
-        rec = {"side": "LONG" if o["side"] == "buy" else "SHORT", "open": o["entry_price"], "close": round(price, 4), "entry_price": o["entry_price"], "exit": round(price, 4), "gross": round(gross, 4), "fee": round(fee, 4), "profit": round(net, 4), "pnl": round(net, 4), "fee_open": round(fee_open, 4), "fee_close": round(fee_close, 4), "reason": reason, "id": o["id"], "open_time": o.get("open_time") or now_iso, "close_time": now_iso, "time": now_iso, "operation_day": self.operation_day or now_iso[:10]}
-        self.history.append(rec); self.closed_orders.append(rec)
-        if o["side"] == "buy": self.hist_long_pnl += net
-        else: self.hist_short_pnl += net
-        self.cfg.cofre += net; self.cfg.cofre_global += net; self.cfg.completed_operations += 1
-        opp = "sell" if o["side"] == "buy" else "buy"
-        _esp_entry = round(price - 10.0, 4) if opp == "sell" else round(price + 10.0, 4)
-        _lev_esp = float(self.cfg.leverage)
-        _qty_esp = round(float(self.cfg.margin_per_order) * float(_lev_esp) / _esp_entry, 8)
-        _esp_id = f"ESP_{o['id']}"
-        _base = _esp_id; _n = 1
-        _ids = {str(x.get("id")) for x in self.orders_state}
-        while _esp_id in _ids:
-            _n += 1; _esp_id = f"{_base}_{_n}"
-        self.orders_state.append({"id": _esp_id, "display": "ESP LONG" if opp == "buy" else "ESP SHORT", "side": opp, "entry_price": _esp_entry, "entry": _esp_entry, "target": round(_esp_entry + self.cfg.grid_step_price, 4) if opp == "buy" else round(_esp_entry - self.cfg.grid_step_price, 4), "qty": _qty_esp, "lev": _lev_esp, "status": "PENDING", "open_price": None, "open_time": None, "best_net": 0.0, "armed": False})
-        self._rebalance(price, o["side"], opp, _esp_id)
-        return net
-    def tick(self, price=None):
-        if price is None: price = fetch_price()
-        if not price or price <= 0: return
-        with self.lock:
-            self.prev_price = self.last_price if self.last_price > 0 else price
-            self.last_price = price; self.last_tick_time = time.time()
-            self.price_history.append(price)
-            if len(self.price_history) > 120: self.price_history = self.price_history[-120:]
-            if not self.cfg.is_running: return
-            # Teto -5%: se vivo < -5% saldo, nao abre novas, so limpa
-            _live_tmp = sum(self._net_live(o, price) for o in self.orders_state if o.get('status')=='ACTIVE') if price>0 else 0.0
-            self._teto_bloqueado = _live_tmp < -0.05*float(self.cfg.saldo_operacao)
-            # Grelha movel + compensacao (so quando ja entrou)
-            if not self.aguardando_entrada:
-                self._grelha_movel(price)
-                self._compensacao(price)
-            if self.aguardando_entrada:
-                self._tentar_entrar()
-                return
-            step = float(self.cfg.grid_step_price)
-            ativas = sum(1 for x in self.orders_state if x.get("status") == "ACTIVE")
-            uso = ativas * float(self.cfg.margin_per_order)
-            for o in list(self.orders_state):
-                if o.get("status") == "PENDING":
-                    if uso >= float(self.cfg.saldo_operacao):
-                        continue
-                    if getattr(self, '_teto_bloqueado', False):
-                        continue
-                    _vai_ativar = (o["side"] == "buy" and price >= o["entry_price"]) or (o["side"] == "sell" and price <= o["entry_price"])
-                    if not _vai_ativar:
-                        continue
-                    if o["side"] == "buy" and price >= o["entry_price"]:
-                        o["status"] = "ACTIVE"; o["open_price"] = o["entry_price"]; o["open_time"] = datetime.now(timezone.utc).isoformat(); uso += float(self.cfg.margin_per_order)
-                    elif o["side"] == "sell" and price <= o["entry_price"]:
-                        o["status"] = "ACTIVE"; o["open_price"] = o["entry_price"]; o["open_time"] = datetime.now(timezone.utc).isoformat(); uso += float(self.cfg.margin_per_order)
-                    else: continue
-                if o.get("status") != "ACTIVE": continue
-                net = self._net(o, price)
-                if net > o.get("best_net", 0.0): o["best_net"] = net
-                target = o["entry_price"] + step if o["side"] == "buy" else o["entry_price"] - step
-                hit = (price >= target) if o["side"] == "buy" else (price <= target)
-                if hit and net >= 0:
-                    self._close(o, target, "GRID V6"); continue
-                if net >= TRAVA_LIQUIDO: o["armed"] = True
-                if o.get("armed") and net < o.get("best_net", 0.0) and net >= 0:
-                    self._close(o, price, "TRAVA"); continue
-    def start_background_loop(self):
-        if self._bg: return True
-        self._bg = True
-        def _loop():
-            while self._bg:
-                try:
-                    if has_api_keys() and int(time.time()) % 15 == 0:
-                        b = fetch_bybit_real_balance()
-                        if b is not None: self.real_balance = b
-                    self.tick()
-                except Exception: pass
-                time.sleep(0.12)
-        self._bg_thread = threading.Thread(target=_loop, daemon=True); self._bg_thread.start(); return True
-engine = Engine(cfg)
-engine.start_background_loop()
+            with LOCK: tick()
+        except Exception as e: print("tick err", e)
+        time.sleep(0.12)
+threading.Thread(target=loop, daemon=True).start()
 
-HTML = """<!DOCTYPE html><html lang="pt"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>ND-Scalping</title><style>*{box-sizing:border-box}body{font-family:-apple-system,Arial;background:#0b1220;color:#f8fafc;margin:0;padding:0;padding-bottom:80px;font-size:14px}.top{position:sticky;top:0;background:#0b1220;padding:12px 14px 8px;border-bottom:1px solid #1e293b;z-index:10}.top h1{margin:0;font-size:17px;color:#22c55e;display:inline}.badge{font-size:11px;padding:5px 10px;border-radius:20px;font-weight:700}.badge-paper{background:#f59e0b;color:#000}.badge-real{background:#ef4444;color:#fff}.tabs{position:fixed;bottom:0;left:0;right:0;z-index:50;display:flex;gap:6px;padding:10px 12px;background:#0b1220;border-top:1px solid #1e293b;justify-content:center}.tabs button{border:none;background:#162033;color:#94a3b8;padding:9px 12px;border-radius:20px;font-size:13px;font-weight:700;cursor:pointer}.tabs button.active{background:#22c55e;color:#000}.wrap{padding:0 14px;max-width:560px;margin:0 auto}.card{background:#162033;border:1px solid #1e293b;border-radius:14px;padding:14px;margin-bottom:12px}.card h3{margin:0 0 8px;color:#38bdf8;font-size:12px;letter-spacing:1px;text-transform:uppercase}.big{font-size:16px;font-weight:800}.green{color:#22c55e}.red{color:#ef4444}.muted{color:#94a3b8;font-size:12px;line-height:1.5}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}label{display:block;font-size:11px;color:#38bdf8;font-weight:700;margin:12px 0 5px;text-transform:uppercase}input,select{width:100%;padding:11px;border-radius:10px;border:1px solid #1e293b;background:#0b1220;color:#fff;font-size:14px}input[readonly]{background:#0f172a;color:#94a3b8}.btn{width:100%;padding:13px;border:none;border-radius:12px;font-weight:800;font-size:14px;cursor:pointer;margin-top:10px}.btn-start{background:#22c55e;color:#000}.btn-stop{background:#ef4444;color:#fff}.btn-blue{background:#0284c7;color:#fff}.page{display:none}.page.active{display:block}.hist-item{background:#0b1220;border:1px solid #1e293b;border-radius:10px;padding:8px 10px;margin:6px 0;font-size:12px;line-height:1.4}.hist-item .h-small{font-size:11px;color:#94a3b8;margin-top:2px}canvas{width:100%;height:220px;background:#0b1220;border:1px solid #1e293b;border-radius:12px;display:block}.legend{display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:#94a3b8;margin:8px 0}.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px;vertical-align:middle}.pill{display:inline-block;padding:5px 10px;border-radius:20px;font-size:12px;font-weight:800}.pill-limpo{background:#14532d;color:#bbf7d0}.pill-sujo{background:#7f1d1d;color:#fecaca}.pill-an{background:#713f12;color:#fde68a}.grid-top{text-align:center;margin:10px 0 12px}.grid-pill{display:inline-block;background:#facc15;color:#000;font-weight:800;padding:7px 12px;border-radius:20px;font-size:13px}.grid-dash{color:#facc15;font-weight:800;letter-spacing:2px}.grid2{display:grid;grid-template-columns:1fr 4px 1fr;border-radius:12px;overflow:hidden;border:1px solid #1e293b}.gridL{background:#2a0f0f;padding:10px}.gridR{background:#0f2a1a;padding:10px}.gridDiv{background:#facc15;position:relative}.gridDiv span{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%) rotate(90deg);background:#facc15;color:#000;font-size:10px;font-weight:800;padding:2px 6px;border-radius:6px}.gridL h4{margin:0 0 8px;color:#ef4444;font-size:12px}.gridR h4{margin:0 0 8px;color:#22c55e;font-size:12px}.ord{border-bottom:1px solid rgba(255,255,255,.08);padding:7px 0;font-size:12px;line-height:1.45}.ord:last-child{border-bottom:none}</style></head><body><div class="top"><h1>ND-SCALPING</h1> <span id="modeBadge" class="badge badge-paper">PAPEL</span><div class="muted" id="upd">A ligar...</div></div><div class="wrap"><div id="pg-dash" class="page active"><div class="card"><h3>Status - Analise Bybit</h3><div class="big" id="st">--</div><div class="muted" id="stline">--</div><div style="margin-top:8px"><span id="terrenoPill" class="pill pill-an">A ANALISAR</span></div><div class="muted" id="analise">--</div><div class="row"><div><h3>Saldo total da conta</h3><div class="big green" id="totalConta">--</div><div class="muted" id="totalNota">So muda ao fechar a operacao</div></div><div><h3>Saldo em operacao</h3><div class="big green" id="saldoOpAtual">--</div><div class="muted" id="saldoOpNota">--</div></div></div></div><div class="card"><h3>Posicao atual - Ao vivo</h3><div class="muted" id="posline">--</div><div class="big" id="tot">+0.0000</div><div class="muted" id="cofre">Cofre ciclo: 0.0000 | Cofre global: 0.0000</div><div class="muted" id="emuso">--</div></div><div class="card"><h3>Grid — Ref no centro</h3><div class="grid-top"><span class="grid-dash">- - - -</span> <span class="grid-pill" id="gridPill">Ref: -- • Preço: --</span> <span class="grid-dash">- - - -</span></div><div class="muted" id="gridNota">--</div><div class="grid2"><div class="gridL"><h4>▼ SHORT — ABAIXO DA REF</h4><div id="colShort">Sem SHORTs.</div></div><div class="gridDiv"><span>REF</span></div><div class="gridR"><h4>▲ LONG — ACIMA DA REF</h4><div id="colLong">Sem LONGs.</div></div></div><div class="muted" style="margin-top:8px" id="actCount">--</div></div><button id="toggleBtn" class="btn btn-start" onclick="toggleBot()">INICIAR ROBÔ</button><div class="muted">Um botao so: verde INICIAR / vermelho PARAR.</div></div><div id="pg-merc" class="page"><div class="card"><h3>Mercado - Grafico Bybit</h3><div class="muted" id="mline">--</div><canvas id="chart" width="480" height="220"></canvas><div class="legend"><span><span class="dot" style="background:#38bdf8"></span>Preco Bybit</span><span><span class="dot" style="background:#f59e0b"></span>Ref (escolhida pelo robo)</span><span><span class="dot" style="background:#22c55e"></span>Entradas LONG</span><span><span class="dot" style="background:#ef4444"></span>Entradas SHORT</span></div><div class="muted" id="mleg">A linha azul e a trajetoria do preco na Bybit.</div><div class="card" style="margin-top:12px;margin-bottom:0"><h3>Ordens abertas - Contagem</h3><div class="muted" id="contagem">--</div></div></div></div><div id="pg-hist" class="page"><div class="card"><h3>Historico - Por data</h3><label>Escolhe o dia</label><input id="fData" type="date" onchange="carregar()"><div class="muted" id="hDataLabel">--</div><div class="big" id="hTot">+0.0000 USDT</div><div class="muted" id="hPct">--</div><div class="muted" id="hLS">--</div><div class="muted" id="hN">0 ordens</div><div id="hlist">Sem ordens fechadas neste dia.</div></div></div><div id="pg-aj" class="page"><div class="card"><h3>Ajustes</h3><label>Moeda</label><select id="fCoin" onchange="mudarMoeda()"><option value="BTC">BTC / USDT</option><option value="ETH">ETH / USDT</option><option value="SOL">SOL / USDT</option><option value="BNB">BNB / USDT</option><option value="XRP">XRP / USDT</option><option value="ADA">ADA / USDT</option></select><div class="muted" id="moedaInfo">Moeda atual: BTC - fonte: Bybit</div><label>Saldo da conta (fixo no codigo)</label><input type="text" value="10000 USDT" readonly><label>Saldo da operacao (USDT)</label><input id="fSaldoOp" type="number" value="1000"><label>Margem por ordem (USDT)</label><input id="fMarg" type="number" value="30"><label>Alavancagem (1 a 20)</label><input id="fLev" type="number" value="15"><label>Espacamento Grid - Passo (em preco)</label><input id="fStep" type="number" value="90"><div class="muted" id="passoSug">Passo sugerido BTC: 90</div><label>Numero total de ordens</label><input id="fTot" type="number" value="14"><label>Lucro por operacao (USDT)</label><input id="fLucro" type="number" value="5"><label>Modo</label><select id="fModo"><option value="auto">Automatico</option><option value="manual">Manual</option></select><label>Operacoes por dia (0 = sem limite)</label><input id="fOps" type="number" value="10"><button class="btn btn-blue" onclick="guardar()">GUARDAR</button><div class="muted">Preco de entrada: decide o ROBO. Trava rigida no codigo: arma a liquido 0.002, segue o melhor, recuo 0.</div></div></div></div><div class="tabs"><button id="t-dash" class="active" onclick="show('dash')">Dashboard</button><button id="t-merc" onclick="show('merc')">Mercado</button><button id="t-hist" onclick="show('hist')">Historico</button><button id="t-aj" onclick="show('aj')">Ajustes</button></div><script>var SUG={BTC:90,ETH:3,SOL:0.30,BNB:2,XRP:0.02,ADA:0.02};var LAST=null;function show(p){['dash','merc','hist','aj'].forEach(function(k){document.getElementById('pg-'+k).classList.toggle('active',k===p);document.getElementById('t-'+k).classList.toggle('active',k===p);});if(p==='merc'&&LAST)desenhar(LAST);}function fmt(n){return (n>=0?'+':'')+Number(n||0).toFixed(4);}function shortNome(o){if(o.display)return o.display;if(o.id&&o.id.indexOf('ESP')>=0)return o.side==='buy'?'ESP LONG':'ESP SHORT';return o.side==='buy'?'LONG':'SHORT';}function toggleBot(){var run=LAST&&LAST.is_running;fetch('/api/'+(run?'stop':'start'),{method:'POST'}).then(function(){carregar();});}function mudarMoeda(){var c=document.getElementById('fCoin').value;document.getElementById('fStep').value=SUG[c];document.getElementById('passoSug').innerText='Passo sugerido '+c+': '+SUG[c];document.getElementById('moedaInfo').innerText='Moeda atual: '+c+' - fonte: Bybit';}function guardar(){var b={coin:document.getElementById('fCoin').value,saldo_operacao:parseFloat(document.getElementById('fSaldoOp').value)||1000,margin_per_order:parseFloat(document.getElementById('fMarg').value)||30,leverage:parseInt(document.getElementById('fLev').value)||15,grid_step_price:parseFloat(document.getElementById('fStep').value)||80,total_orders:parseInt(document.getElementById('fTot').value)||14,lucro_por_operacao:parseFloat(document.getElementById('fLucro').value)||5,modo_operacao:document.getElementById('fModo').value,operacoes_por_dia:parseInt(document.getElementById('fOps').value)||0};fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(function(){alert('Guardado. Faz PARAR + INICIAR para o novo ciclo usar.');});}function desenhar(s){var cv=document.getElementById('chart');if(!cv)return;var ctx=cv.getContext('2d');var W=cv.width,H=cv.height;ctx.clearRect(0,0,W,H);var hist=s.price_history||[];if(hist.length<2)hist=[s.last_price||0,s.last_price||0];var entries=(s.orders||[]).filter(function(o){return o.status==='ACTIVE'||o.status==='PENDING';}).map(function(o){return o.entry_price;});var all=hist.concat(entries).concat([s.reference_price||0]).filter(function(v){return v>0;});if(!all.length)return;var mn=Math.min.apply(null,all),mx=Math.max.apply(null,all);if(mx===mn){mx=mn+1;}function X(i){return 10+(W-20)*i/Math.max(1,hist.length-1);}function Y(v){return H-15-(H-30)*(v-mn)/(mx-mn);}ctx.strokeStyle='#1e293b';ctx.lineWidth=1;for(var g=0;g<4;g++){var yv=15+g*(H-30)/3;ctx.beginPath();ctx.moveTo(10,yv);ctx.lineTo(W-10,yv);ctx.stroke();}ctx.strokeStyle='#38bdf8';ctx.lineWidth=2;ctx.beginPath();hist.forEach(function(p,i){if(i===0)ctx.moveTo(X(i),Y(p));else ctx.lineTo(X(i),Y(p));});ctx.stroke();ctx.fillStyle='#38bdf8';ctx.beginPath();ctx.arc(X(hist.length-1),Y(hist[hist.length-1]),4,0,7);ctx.fill();if(s.reference_price){ctx.strokeStyle='#f59e0b';ctx.setLineDash([6,4]);ctx.beginPath();ctx.moveTo(10,Y(s.reference_price));ctx.lineTo(W-10,Y(s.reference_price));ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='#f59e0b';ctx.font='11px Arial';ctx.fillText('Ref '+s.reference_price,12,Y(s.reference_price)-4);}entries.forEach(function(e,i){var o=(s.orders||[]).filter(function(x){return x.status==='ACTIVE'||x.status==='PENDING';})[i];if(!o)return;ctx.fillStyle=o.side==='buy'?'#22c55e':'#ef4444';ctx.beginPath();ctx.arc(W-16,Y(e),3,0,7);ctx.fill();});}function ordHtml(o){return '<div class="ord"><b>'+shortNome(o)+'</b> • '+o.status+'<br>'+o.entry_price+' → '+o.target+' • <span class="'+(o.pnl_live>=0?'green':'red')+'">'+fmt(o.pnl_live)+'</span><br>Falta <b>'+(o.falta_pct!=null?o.falta_pct:100)+'%</b> para o alvo</div>';}function carregar(){fetch('/api/status').then(function(r){return r.json();}).then(function(s){LAST=s;var tb=document.getElementById('toggleBtn');tb.innerText=s.is_running?'PARAR ROBÔ':'INICIAR ROBÔ';tb.className='btn '+(s.is_running?'btn-stop':'btn-start');document.getElementById('modeBadge').innerText=s.paper_trading?'PAPEL':'REAL';document.getElementById('modeBadge').className='badge '+(s.paper_trading?'badge-paper':'badge-real');var _d=new Date();var _ms=('00'+_d.getMilliseconds()).slice(-3);document.getElementById('upd').innerText='Atualizado: '+_d.toLocaleTimeString()+'.'+_ms+' | Fonte: Bybit'+(s.has_keys?' | Ligado à Bybit (Conta REAL)':' | Sem chaves - virtual');document.getElementById('st').innerText=s.is_running?(s.aguardando_entrada?'A ANALISAR - A AGUARDAR TERRENO LIMPO':'A OPERAR'):'PARADO';document.getElementById('stline').innerText='Par: '+(s.active_symbol||'BTC/USDT:USDT')+' | Preco Bybit: '+(s.last_price||'--')+' | Ref: '+(s.reference_price||'-- (ainda nao entrou)')+' | Modo: '+(s.paper_trading?'PAPEL (simulacao REAL)':'REAL - Bybit');var pill=document.getElementById('terrenoPill');pill.innerText=s.terreno||'A ANALISAR';pill.className='pill '+(s.terreno==='LIMPO'?'pill-limpo':((s.terreno==='SOBRECOMPRADO'||s.terreno==='SOBREVENDIDO'||s.terreno==='FUGA')?'pill-sujo':'pill-an'));document.getElementById('analise').innerText=s.analise_msg||'--';document.getElementById('totalConta').innerText=Number(s.saldo_total||10000).toFixed(2)+' USDT';document.getElementById('totalNota').innerText=s.has_keys&&s.real_balance!=null?('Saldo real Bybit: '+Number(s.real_balance).toFixed(2)+' USDT'):'So muda ao fechar a operacao';document.getElementById('saldoOpAtual').innerText=Number(s.saldo_operacao_atual||s.saldo_operacao||1000).toFixed(2)+' USDT';document.getElementById('saldoOpNota').innerText='Inicio: '+(s.saldo_operacao||1000)+' | Lucros/perdas mexem aqui';document.getElementById('posline').innerText='Preco Bybit: '+(s.last_price||'--')+' | Ref: '+(s.reference_price||'--')+' | Entrada escolhida pelo robo: '+(s.entrada_preco||'--');document.getElementById('tot').innerText=fmt(s.live_total||0);document.getElementById('cofre').innerText='Cofre ciclo: '+Number(s.cofre||0).toFixed(4)+' | Cofre global: '+Number(s.cofre_global||0).toFixed(4);document.getElementById('emuso').innerText='Saldo da operacao: '+(s.saldo_operacao||1000)+' USDT | Em uso: '+Number((s.margin_per_order||30)*(s.live_orders||[]).length).toFixed(2)+' / '+(s.saldo_operacao||1000)+' USDT';document.getElementById('gridPill').innerText='Ref: '+(s.reference_price||'--')+' • Preço: '+(s.last_price||'--');document.getElementById('gridNota').innerText='Trava rigida MILISSEGUNDOS: arma a +0.002 liquido, segue o melhor, recuo 0. Mal recua 1 tick, fecha logo. Taxa: abertura ao abrir, fecho so ao fechar.';var shorts=(s.orders||[]).filter(function(o){return o.side==='sell';});var longs=(s.orders||[]).filter(function(o){return o.side==='buy';});var liveMap={};(s.live_orders||[]).forEach(function(o){liveMap[o.id]=o;});function withLive(o){var l=liveMap[o.id];if(l){o.pnl_live=l.pnl_live;o.falta_pct=l.falta_pct;}else{o.pnl_live=0;o.falta_pct=100;}return o;}document.getElementById('colShort').innerHTML=shorts.length?shorts.map(function(o){return ordHtml(withLive(o));}).join(''):'Sem SHORTs.';document.getElementById('colLong').innerHTML=longs.length?longs.map(function(o){return ordHtml(withLive(o));}).join(''):'Sem LONGs.';document.getElementById('actCount').innerText=(s.live_orders||[]).length+' ativas | '+(s.orders||[]).filter(function(o){return o.status==='PENDING';}).length+' a espera | '+(s.history||[]).length+' fechadas (ver Historico)';document.getElementById('mline').innerText='Preco Bybit: '+(s.last_price||'--')+' | Ref: '+(s.reference_price||'--')+' | Moeda: '+(s.coin||'BTC');var _ords=s.orders||[];function _cnt(side,isEsp,st){return _ords.filter(function(o){return o.side===side&&((String(o.id||'').indexOf('ESP')>=0)===isEsp)&&o.status===st;}).length;}var _lp=_cnt('buy',false,'PENDING'),_la=_cnt('buy',false,'ACTIVE'),_lep=_cnt('buy',true,'PENDING'),_lea=_cnt('buy',true,'ACTIVE');var _sp=_cnt('sell',false,'PENDING'),_sa=_cnt('sell',false,'ACTIVE'),_sep=_cnt('sell',true,'PENDING'),_sea=_cnt('sell',true,'ACTIVE');document.getElementById('contagem').innerHTML='LONG — Pending: <b>'+_lp+'</b> | Active: <b>'+_la+'</b> | Esp Pending: <b>'+_lep+'</b> | Esp Active: <b>'+_lea+'</b><br>SHORT — Pending: <b>'+_sp+'</b> | Active: <b>'+_sa+'</b> | Esp Pending: <b>'+_sep+'</b> | Esp Active: <b>'+_sea+'</b><br>Total ativas: <b>'+(_la+_lea+_sa+_sea)+'</b> / 8 max';document.getElementById('mleg').innerText='Trajetoria Bybit: '+(s.price_dir==='up'?'a subir':(s.price_dir==='down'?'a descer':'estavel'))+' | Terreno: '+(s.terreno||'--');var sel=document.getElementById('fData').value;var hAll=s.history||[];var h=hAll;if(sel){h=hAll.filter(function(x){return (x.operation_day||x.time||'').slice(0,10)===sel;});document.getElementById('hDataLabel').innerText='Dia: '+sel+' (operacoes que comecaram neste dia - se passou da meia-noite, contam no dia em que comecaram)';}else{document.getElementById('hDataLabel').innerText='Escolhe um dia para ver so esse dia. Sem data, mostra tudo.';}var tl=0,ts=0,tln=0,tsn=0;h.forEach(function(x){if(x.side==='LONG'){tl+=x.profit||0;tln++;}else{ts+=x.profit||0;tsn++;}});var tot=tl+ts;var pct=s.saldo_operacao?tot/Number(s.saldo_operacao)*100:0;document.getElementById('hTot').innerText=fmt(tot)+' USDT';document.getElementById('hPct').innerText='Percentagem sobre saldo da operacao ('+(s.saldo_operacao||1000)+' USDT): '+(pct>=0?'+':'')+pct.toFixed(2)+'%';document.getElementById('hLS').innerHTML='LONG: '+fmt(tl)+' USDT | '+tln+' ordens<br>SHORT: '+fmt(ts)+' USDT | '+tsn+' ordens';document.getElementById('hN').innerText=h.length+' ordens';document.getElementById('hlist').innerHTML=h.length?h.slice(-50).reverse().map(function(x){var _mot=(x.reason==='GRID V6'?'Alvo':(x.reason==='TRAVA'?'Trava':(x.reason==='COMPENSACAO'?'Compensacao':(x.reason||''))));return '<div class="hist-item"><b>'+x.side+'</b> | '+(x.open_hhmm||'--:--')+' → '+(x.close_hhmm||'--:--')+' | <b>'+fmt(x.profit)+' USDT</b><div class="h-small">'+(x.open!=null?x.open:'--')+' → '+(x.close!=null?x.close:'--')+' • '+_mot+'</div></div>';}).join(''):'Sem ordens fechadas neste dia.';if(document.getElementById('pg-merc').classList.contains('active'))desenhar(s);}).catch(function(){document.getElementById('upd').innerText='Sem ligacao ao servidor - verifica o Render.';});}carregar();setInterval(carregar,300);</script></body></html>"""
+HTML = open("/tmp/base.html").read() if False else None
+TEMPLATE = r"""<!doctype html><html lang="pt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ND-SCALPING</title><style>body{background:#0b0f14;color:#e8eef5;font-family:system-ui;margin:0;padding:16px}h1{font-size:20px}.card{background:#111820;border:1px solid #263242;border-radius:12px;padding:14px;margin:10px 0}button{padding:12px 18px;border:0;border-radius:10px;font-weight:700;cursor:pointer;width:100%;margin:6px 0}input{width:100%;padding:10px;border-radius:8px;border:1px solid #263242;background:#0b0f14;color:#fff;margin:4px 0}.grid{display:flex;gap:0}.col{flex:1;padding:8px}.short{background:#2a1212}.long{background:#122a1a}.ref{background:#facc15;color:#000;padding:8px;border-radius:20px;text-align:center;font-weight:800}small{color:#9fb0c3}</style></head><body>
+<h1>ND-SCALPING <span style="background:#f59e0b;color:#000;padding:4px 10px;border-radius:20px">PAPEL</span></h1>
+<div class="card"><b>STATUS - ANALISE BYBIT</b><div id="status">A carregar...</div>
+<div style="display:flex;gap:12px"><div><small>SALDO TOTAL DA CONTA</small><div id="total" style="font-size:22px;color:#00c853;font-weight:800">10000.00 USDT</div><small>So muda ao fechar a operacao</small></div>
+<div><small>SALDO EM OPERACAO</small><div id="op" style="font-size:22px;color:#00c853;font-weight:800">1000 USDT</div><small id="opinfo"></small></div></div></div>
+<div class="card"><b>POSICAO ATUAL - AO VIVO</b><div id="pos"></div></div>
+<div class="card"><b>GRID — REF NO CENTRO</b><div class="ref" id="refline"></div><small>Trava rigida: arma a 60% do caminho ate ao alvo, segue o melhor, recuo 0. Mal recua 1 tick, fecha logo. Taxa: abertura ao abrir, fecho so ao fechar. Passo fixo - escolha do operador, sistema nao muda.</small>
+<div class="grid"><div class="col short" id="colShort"></div><div style="width:4px;background:#facc15"></div><div class="col long" id="colLong"></div></div>
+<div id="counts"></div></div>
+<div class="card"><b>HISTORICO</b><div id="hist"></div></div>
+<div class="card"><b>AJUSTES</b>
+<label>Passo (BTC) - escolha do operador, fixo, sistema nao muda <input id="passo" type="number" value="80"></label>
+<label>Saldo em operacao <input id="opb" type="number" value="1000"></label>
+<label>Margem por ordem <input id="marg" type="number" value="100"></label>
+<label>Alavancagem <input id="lev" type="number" value="15"></label>
+<button onclick="save()" style="background:#2563eb;color:#fff">GUARDAR AJUSTES</button>
+<button id="btn" onclick="toggle()" style="background:#00c853">INICIAR ROBÔ</button>
+<button onclick="stop()" style="background:#dc2626;color:#fff">PARAR ROBÔ</button>
+<small>Passo fixo: tu escolhes, sistema nunca altera. Pinca: fecha uma -> nascem 2 (SHORT -25, LONG +20). Guardiao: ativa + avanca 10 -> nasce a 10 da ativacao, lado oposto.</small></div>
+<script>
+async function load(){let r=await fetch('/api/status');let d=await r.json();
+document.getElementById('status').innerHTML='Preco Bybit: '+d.last_price+' | Ref: '+d.ref+' | Modo: PAPEL';
+document.getElementById('total').innerText=(10000+d.cofre_global).toFixed(2)+' USDT';
+document.getElementById('op').innerText=(d.op_balance+d.cofre).toFixed(2)+' USDT';
+document.getElementById('opinfo').innerText='Inicio: '+d.op_balance+' | Lucros/perdas mexem aqui';
+document.getElementById('pos').innerHTML='Preco: '+d.last_price+' | Ref: '+d.ref+' | Entrada: '+d.entry_ref+'<br><b>'+d.live_total+'</b><br>Cofre ciclo: '+d.cofre+' | Cofre global: '+d.cofre_global;
+document.getElementById('refline').innerText='Ref: '+d.ref+' • Preço: '+d.last_price;
+// ordena: ACTIVE primeiro, depois PENDING, por distancia ao preco
+function sort(arr){return arr.sort((a,b)=>{let ra=a.status=='ACTIVE'?0:1, rb=b.status=='ACTIVE'?0:1; if(ra!=rb) return ra-rb; return Math.abs(a.entry-d.last_price)-Math.abs(b.entry-d.last_price);});}
+let shorts=sort(d.orders.filter(o=>o.side=='SHORT')); let longs=sort(d.orders.filter(o=>o.side=='LONG'));
+document.getElementById('colShort').innerHTML='<b>▼ SHORT — ABAIXO DA REF</b><br>'+shorts.map(o=>'<div><b>'+o.side+' • '+o.status+' • '+o.kind+'</b><br>'+o.entry+' → '+o.target+' • '+ (o.pnl||0) +'<br>Falta '+o.falta+'% para o alvo</div><hr>').join('');
+document.getElementById('colLong').innerHTML='<b>▲ LONG — ACIMA DA REF</b><br>'+longs.map(o=>'<div><b>'+o.side+' • '+o.status+' • '+o.kind+'</b><br>'+o.entry+' → '+o.target+' • '+(o.pnl||0)+'<br>Falta '+o.falta+'% para o alvo</div><hr>').join('');
+document.getElementById('counts').innerText=d.orders.filter(o=>o.status=='ACTIVE').length+' ativas | '+d.orders.filter(o=>o.status=='PENDING').length+' a espera | '+d.history.length+' fechadas';
+document.getElementById('hist').innerHTML=d.history.slice(-20).reverse().map(h=>'<div>'+h.side+' | '+h.open+' → '+h.close+' • '+h.net+' • '+h.reason+'</div>').join('')||'Sem fechadas';
+document.getElementById('btn').innerText=d.is_running?'PARAR ROBÔ':'INICIAR ROBÔ'; document.getElementById('btn').style.background=d.is_running?'#dc2626':'#00c853';
+document.getElementById('passo').value=d.passo;
+}
+async function save(){let b={passo:parseFloat(document.getElementById('passo').value),op_balance:parseFloat(document.getElementById('opb').value),margin:parseFloat(document.getElementById('marg').value),leverage:parseFloat(document.getElementById('lev').value)}; await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}); load();}
+async function toggle(){let r=await fetch('/api/status');let d=await r.json(); if(d.is_running){await fetch('/api/stop',{method:'POST'});}else{await fetch('/api/start',{method:'POST'});} load();}
+async function stop(){await fetch('/api/stop',{method:'POST'}); load();}
+setInterval(load,1000); load();
+</script></body></html>"""
 
 @app.route("/")
-def index():
-    return render_template_string(HTML)
+def index(): return render_template_string(TEMPLATE)
 @app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
+def health(): return jsonify({"status":"ok"})
 @app.route("/api/status")
 def status():
-    try:
-        if time.time() - engine.last_tick_time > 0.2:
-            engine.tick()
-    except Exception: pass
-    with engine.lock:
-        live_orders = []; live_total = 0.0
-        for o in engine.orders_state:
-            if o.get("status") != "ACTIVE": continue
-            pnl = engine._net_live(o, engine.last_price) if engine.last_price > 0 else 0.0
-            live_total += pnl
-            oo = dict(o); oo["pnl_live"] = round(pnl, 4); oo["price_now"] = engine.last_price
-            oo["falta_pct"] = engine._falta_pct(o, engine.last_price)
-            oo["display"] = o.get("display") or ("ESP LONG" if str(o.get("id","")).startswith("ESP") and o.get("side")=="buy" else ("ESP SHORT" if str(o.get("id","")).startswith("ESP") else ("LONG" if o.get("side")=="buy" else "SHORT")))
-            live_orders.append(oo)
-        saldo_op_atual = round(float(cfg.saldo_operacao) + float(cfg.cofre) + float(live_total), 4)
-        vis_orders = [dict(o) for o in engine.orders_state if o.get("status") in ("ACTIVE","PENDING")]
-        for o in vis_orders:
-            o["display"] = o.get("display") or ("ESP LONG" if str(o.get("id","")).startswith("ESP") and o.get("side")=="buy" else ("ESP SHORT" if str(o.get("id","")).startswith("ESP") else ("LONG" if o.get("side")=="buy" else "SHORT")))
-            o["falta_pct"] = engine._falta_pct(o, engine.last_price) if o.get("status") == "ACTIVE" else 100.0
-            if o.get("status") == "ACTIVE":
-                o["pnl_live"] = round(engine._net_live(o, engine.last_price), 4) if engine.last_price else 0.0
-            else:
-                o["pnl_live"] = 0.0
-        hist_out = []
-        for r in engine.history:
-            rr = dict(r)
-            rr["open_hhmm"] = hhmm(r.get("open_time") or r.get("time") or "")
-            rr["close_hhmm"] = hhmm(r.get("close_time") or r.get("time") or "")
-            hist_out.append(rr)
-        real_bal = engine.real_balance
-        if has_api_keys() and real_bal is None:
-            real_bal = fetch_bybit_real_balance()
-            if real_bal is not None: engine.real_balance = real_bal
-        return jsonify({"is_running": cfg.is_running, "aguardando_entrada": engine.aguardando_entrada, "terreno": engine.terreno, "analise_msg": engine.analise_msg, "entrada_preco": engine.entrada_preco, "active_symbol": cfg.active_symbol, "coin": cfg.coin, "selected_pair": cfg.selected_pair, "equity": round(float(cfg.saldo_total) + float(cfg.cofre) + float(live_total), 4), "saldo_total": round(float(cfg.saldo_total), 4), "saldo_operacao_atual": saldo_op_atual, "cycle_equity": cfg.cycle_initial_equity, "initial": PAPER_INITIAL_BALANCE, "live_orders": live_orders, "live_total": round(live_total, 4), "price_dir": "up" if engine.last_price > engine.prev_price else "down", "tick_age": round(time.time() - engine.last_tick_time, 1) if engine.last_tick_time else 99, "vantagem": round(float(cfg.cofre), 4), "lucro_por_operacao": cfg.lucro_por_operacao, "modo_operacao": cfg.modo_operacao, "operacoes_por_dia": cfg.operacoes_por_dia, "bloquear_novas": engine.bloquear_novas, "net_pnl": round(float(cfg.cofre) + live_total, 4), "completed_operations": cfg.completed_operations, "max_auto_operations": cfg.max_auto_operations, "auto_mode": cfg.auto_mode, "status_message": cfg.status_message, "orders": vis_orders, "cofre": cfg.cofre, "cofre_global": cfg.cofre_global, "reference_price": engine.reference_price, "last_price": engine.last_price, "paper_trading": cfg.paper_trading, "has_keys": has_api_keys(), "real_balance": real_bal, "paper_equity": engine.paper_equity, "history": hist_out, "leverage": cfg.leverage, "total_orders": cfg.total_orders, "per_side": engine.per_side, "first_dist": engine.first_dist, "grid_step": cfg.grid_step_price, "margin_per_order": cfg.margin_per_order, "saldo_operacao": cfg.saldo_operacao, "ticker_err": "", "price_history": list(engine.price_history), "operation_day": engine.operation_day})
-@app.route("/api/state")
-def state_alias():
-    return status()
-@app.route("/api/start", methods=["POST"])
-def start():
-    return jsonify(engine.start_bot())
-@app.route("/api/stop", methods=["POST"])
-def stop():
-    return jsonify(engine.stop_bot(close_all=True))
-@app.route("/api/toggle", methods=["POST"])
-def toggle():
-    if cfg.is_running:
-        return jsonify(engine.stop_bot(close_all=True))
-    return jsonify(engine.start_bot())
+    p=STATE["last_price"]
+    orders=[]
+    live=0
+    for o in STATE["orders"]:
+        pnl = round((p-o["entry"])*o["qty"] if o["side"]=="LONG" else (o["entry"]-p)*o["qty"],4)
+        live+=pnl if o["status"]=="ACTIVE" else 0
+        falta=0
+        if o["status"]=="ACTIVE":
+            moved=(p-o["entry"]) if o["side"]=="LONG" else (o["entry"]-p)
+            falta=max(0, round(100*(1-moved/float(CFG["passo"])),1)) if CFG["passo"] else 100
+        else: falta=100
+        orders.append({**o, "pnl": pnl, "falta": falta})
+    return jsonify({"is_running": CFG["is_running"], "last_price": p, "ref": STATE["ref"], "entry_ref": CFG["entry_ref"],
+                    "orders": orders, "history": STATE["history"], "cofre": round(CFG["cofre"],4), "cofre_global": round(CFG["cofre_global"],4),
+                    "live_total": round(live,4), "op_balance": CFG["op_balance"], "passo": CFG["passo"]})
 @app.route("/api/settings", methods=["POST"])
 def settings():
-    try:
-        d = request.get_json(force=True) or {}
-        new_coin = d.get("coin") or d.get("moeda")
-        if new_coin and str(new_coin).upper() in COINS:
-            engine.switch_pair(COINS[str(new_coin).upper()]["pair"])
-        if "leverage" in d: cfg.leverage = int(d["leverage"])
-        if "margin_per_order" in d: cfg.margin_per_order = float(d["margin_per_order"])
-        if "margin" in d: cfg.margin_per_order = float(d["margin"])
-        if "saldo_operacao" in d: cfg.saldo_operacao = float(d["saldo_operacao"])
-        if "saldo_op" in d: cfg.saldo_operacao = float(d["saldo_op"])
-        if "valor_operacao" in d: cfg.saldo_operacao = float(d["valor_operacao"])
-        if "grid_step_price" in d and float(d["grid_step_price"]) != 0: cfg.grid_step_price = abs(float(d["grid_step_price"]))
-        if "grid_step" in d and float(d["grid_step"]) != 0: cfg.grid_step_price = abs(float(d["grid_step"]))
-        if "total_orders" in d: cfg.total_orders = int(d["total_orders"])
-        if "lucro_por_operacao" in d: cfg.lucro_por_operacao = float(d["lucro_por_operacao"])
-        if "profit" in d: cfg.lucro_por_operacao = float(d["profit"])
-        if "modo_operacao" in d: cfg.modo_operacao = str(d["modo_operacao"])
-        if "mode" in d: cfg.modo_operacao = str(d["mode"])
-        if "operacoes_por_dia" in d: cfg.operacoes_por_dia = int(d["operacoes_por_dia"])
-        if "ops" in d: cfg.operacoes_por_dia = int(d["ops"])
-        if "selected_pair" in d and d["selected_pair"] in TOP_PAIRS: engine.switch_pair(d["selected_pair"])
-        if "pair" in d and d["pair"] in TOP_PAIRS: engine.switch_pair(d["pair"])
-    except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 400
-    return jsonify({"status": "ok", "coin": cfg.coin, "step": cfg.grid_step_price, "margin": cfg.margin_per_order, "saldo_operacao": cfg.saldo_operacao})
-@app.route("/api/switch_pair", methods=["POST"])
-def switch_pair():
-    d = request.get_json(force=True) or {}
-    return jsonify(engine.switch_pair(d.get("selected_pair") or d.get("pair") or cfg.selected_pair))
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    d=request.json or {}
+    # Passo e escolha do operador - sistema nunca altera, so guarda o que operador pos
+    if "passo" in d and float(d["passo"])>0: CFG["passo"]=float(d["passo"])
+    if "op_balance" in d: CFG["op_balance"]=float(d["op_balance"])
+    if "margin" in d: CFG["margin"]=float(d["margin"])
+    if "leverage" in d: CFG["leverage"]=float(d["leverage"])
+    return jsonify({"status":"ok","passo":CFG["passo"]})
+@app.route("/api/start", methods=["POST"])
+def start():
+    with LOCK:
+        CFG["is_running"]=True; CFG["cycle_start"]=time.time()
+        if not STATE["orders"] and not STATE["history"]:
+            STATE["ref"]=STATE["last_price"]; CFG["entry_ref"]=STATE["ref"]
+    return jsonify({"status":"started"})
+@app.route("/api/stop", methods=["POST"])
+def stop():
+    with LOCK:
+        # PARAR fecha tudo a mercado e atualiza total
+        for o in list(STATE["orders"]):
+            if o["status"]=="ACTIVE":
+                close_order(o, STATE["last_price"], "PARAR")
+        CFG["is_running"]=False; STATE["orders"]=[]
+    return jsonify({"status":"stopped"})
+if __name__=="__main__":
+    port=int(os.getenv("PORT","5000")); app.run(host="0.0.0.0", port=port, debug=False)
