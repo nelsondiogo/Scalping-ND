@@ -1,9 +1,11 @@
-# ND-SCALPING V6 - SOLUCAO: PRECO REAL BYBIT + RECENTRALIZAR REF
-# 1) Preco REAL da Bybit, sem random. Se falhar, congela no ultimo preco real, mostra Fonte: Bybit - Cache. Nunca inventa.
-# 2) Recentralizar: se preco afastar >100 da Ref (2x Passo), Pinca velha morre, nasce Pinca nova com Ref nova = Preco atual.
-# 3) Fuga: quando uma ativa, outra foge para Preco -/+ Passo ate ativa fechar. So ativa se afastar 100 da ativa.
-# 4) Trava: vigilancia +0.002, armada Falta<=40% (60% caminho), fecha so se voltar abaixo do preco de armacao. PENDING=0.0000, Falta 100%.
-# Visual antigo exato. Entrada lida da Bybit, Passo fixo dos Ajustes.
+# ND-SCALPING V6 - SOLUCAO DO ERRO: FLUTUAR AO ENCONTRO DO PRECO
+# ERRO ANTIGO: LONG so subia, SHORT so descia. Quando o preco vinha ao encontro, a ordem fugia. Quando fugia, ficava parada. Invertido.
+# CORRECAO: PENDING segue quando o preco foge, para quando o preco vem.
+# LONG: se preco desce (foge), LONG desce para Preco+Passo. Se preco sobe (vem), LONG fica parada a espera de ser tocada.
+# SHORT: se preco sobe (foge), SHORT sobe para Preco-Passo. Se preco desce (vem), SHORT fica parada a espera.
+# Implementacao: LONG entrada = min(entrada_antiga, Preco+Passo) ; SHORT entrada = max(entrada_antiga, Preco-Passo)
+# Assim distancia encolhe quando preco vem, ativa. Nunca fica a 646 de distancia.
+# Preco REAL Bybit, sem random. Congela se falhar. Recentralizar so se preco fugir >100 da Ref sem ACTIVE. Fuga: quando uma ativa, outra foge para Preco-/+Passo e so pode ativar se afastar 100 da ativa. Trava: vigilancia +0.002, armada Falta<=40%, fecha so se voltar abaixo do preco de armacao. PENDING=0.0000, Falta 100%. Visual antigo exato.
 import os, json, time, threading, urllib.request
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
@@ -23,7 +25,6 @@ def default_state():
 state = load() or default_state()
 LAST_REAL = [state.get("price") or 0.0]
 def fetch_bybit_price():
-    # Publico, sem chaves. Tenta Bybit, depois Bytick.
     for url in ["https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT","https://api.bytick.com/v5/market/tickers?category=linear&symbol=BTCUSDT"]:
         try:
             req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
@@ -31,13 +32,9 @@ def fetch_bybit_price():
                 d = json.loads(r.read().decode())
                 p = float(d["result"]["list"][0]["lastPrice"])
                 if p>0:
-                    LAST_REAL[0]=p
-                    state["fonte"]="Bybit - Real"
-                    return p
+                    LAST_REAL[0]=p; state["fonte"]="Bybit - Real"; return p
         except Exception as e:
-            print("bybit fail", url, e)
-            continue
-    # Falhou: CONGELA, nao inventa random
+            print("bybit fail", url, e); continue
     state["fonte"]="Bybit - Cache (ultimo preco real)"
     return LAST_REAL[0] or state.get("price") or 0.0
 def new_pair(ref, price, passo):
@@ -54,7 +51,6 @@ def close_order(o, exit_price, motivo):
     passo = state["settings"]["passo"] or 50
     prog = abs(exit_price - o["entrada"]) / passo if passo else 0
     pnl = round(prog * state["settings"]["lucro_op"] * 0.012, 4)
-    # Se foi para o lado errado, pnl negativo
     mov = (exit_price - o["entrada"]) if o["lado"]=="LONG" else (o["entrada"] - exit_price)
     if mov < 0: pnl = -abs(pnl)
     if motivo=="ORFA-CORTE-100": pnl = -0.2346
@@ -64,36 +60,35 @@ def close_order(o, exit_price, motivo):
 def bot_loop():
     while True:
         try:
-            # Preco REAL sempre, mesmo parado - para mostrar preco real no Dashboard
             p = fetch_bybit_price()
             if p>0:
                 state["price"]=p; state["last_update"]=now()
             if state["running"] and state["price"]>0:
                 price=state["price"]; passo=state["settings"]["passo"] or 50; orders=state["orders"]
-                # === RECENTRALIZAR ===
-                # Se preco fugiu >100 da Ref (2x Passo), Pinca velha morre, nasce Pinca nova com Ref nova = Preco atual.
-                # Corrige o print: SHORT a 57 do preco e LONG a 646. Nunca mais.
+                # RECENTRALIZAR so se sem ACTIVE e preco fugiu >100 da Ref
                 if abs(price - state["ref"]) > 100 and not any(x["tipo"]=="ACTIVE" for x in orders):
-                    state["ref"]=price
-                    state["orders"]=new_pair(price, price, passo)
-                    orders=state["orders"]
-                # Se alguma PENDING ficou a >100 do preco (orfa la em cima / la em baixo), mata e recentraliza
-                for o in list(orders):
-                    if o["tipo"]=="PENDING" and abs(o["entrada"]-price)>100 and not any(x["tipo"]=="ACTIVE" for x in orders):
-                        state["ref"]=price; state["orders"]=new_pair(price, price, passo); orders=state["orders"]; break
-                # 1) FLUTUANTE
+                    state["ref"]=price; state["orders"]=new_pair(price, price, passo); orders=state["orders"]
+                # === FLUTUANTE CORRIGIDO: segue quando preco foge, para quando preco vem ===
                 for o in orders:
                     if o["tipo"]=="PENDING":
                         if o["lado"]=="LONG":
-                            ae=price+passo
-                            if ae>o["entrada"]: o["entrada"]=round(ae,1); o["alvo"]=round(o["entrada"]+passo,1)
+                            # LONG acima: se preco desceu, desce atras para Preco+Passo. Se preco subiu, NAO sobe, fica parada a espera.
+                            nova = round(price + passo, 1)
+                            if nova < o["entrada"]:
+                                o["entrada"]=nova; o["alvo"]=round(o["entrada"]+passo,1)
                         else:
-                            ae=price-passo
-                            if ae<o["entrada"]: o["entrada"]=round(ae,1); o["alvo"]=round(o["entrada"]-passo,1)
+                            # SHORT abaixo: se preco subiu, sobe atras para Preco-Passo. Se preco desceu, NAO desce, fica parada a espera.
+                            nova = round(price - passo, 1)
+                            if nova > o["entrada"]:
+                                o["entrada"]=nova; o["alvo"]=round(o["entrada"]-passo,1)
                         o["pnl"]=0.0; o["falta"]=100.0; o["trava"]=""
-                # 2) ATIVACAO
+                # ATIVACAO
                 for o in list(orders):
                     if o["tipo"]=="PENDING":
+                        # Se ha ACTIVE, PENDING fugida so pode ativar se preco afastar 100 da ativa
+                        act = next((x for x in orders if x["tipo"]=="ACTIVE"), None)
+                        if act is not None and abs(price - act["entrada"]) < 100:
+                            continue
                         if o["lado"]=="LONG" and price>=o["entrada"]:
                             o["tipo"]="ACTIVE"; o["best"]=price; o["armado_em"]=None; o["armado"]=False
                             for out in orders:
@@ -116,7 +111,7 @@ def bot_loop():
                         extra["tipo"]="PENDING"; extra["pnl"]=0.0; extra["falta"]=100.0
                         if extra["lado"]=="LONG": extra["entrada"]=round(price+passo,1); extra["alvo"]=round(extra["entrada"]+passo,1)
                         else: extra["entrada"]=round(price-passo,1); extra["alvo"]=round(extra["entrada"]-passo,1)
-                # 3) ACTIVE: Falta, Trava, Alvo, Orfa
+                # ACTIVE
                 for o in list(orders):
                     if o["tipo"]=="ACTIVE":
                         mov=(price-o["entrada"]) if o["lado"]=="LONG" else (o["entrada"]-price)
@@ -153,7 +148,7 @@ HTML='''
 <div id="tab-dash">
 <div class="card"><b>STATUS - ANALISE BYBIT</b><div id="status"></div><div style="display:flex;gap:10px;margin-top:10px"><div><div class="small">SALDO TOTAL DA CONTA</div><div class="big green" id="saldoTotal">--</div></div><div><div class="small">SALDO EM OPERACAO</div><div class="big green" id="saldoOp">--</div></div></div><div class="small">So muda ao fechar a operacao | Inicio: <span id="saldoInicio"></span></div></div>
 <div class="card"><b>POSICAO ATUAL - AO VIVO</b><div id="pos"></div><button id="mainBtn" class="btn btn-start" onclick="toggle()">INICIAR BOT</button></div>
-<div class="card"><b>GRID — REF NO CENTRO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">Trava rigida MILISSEGUNDOS: arma a +0.002 liquido, segue o melhor, recuo 0. Mal recua 1 tick, fecha logo. Armada a Falta &lt;=40% — fecha so se voltar abaixo do preco de armacao.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
+<div class="card"><b>GRID — REF NO CENTRO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">Trava rigida: arma a +0.002, armada a Falta &lt;=40% — fecha so se voltar abaixo do preco de armacao.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
 </div>
 <div id="tab-merc" class="hidden"><div class="card"><b>MERCADO - GRAFICO BYBIT</b><div id="merc"></div><div style="height:120px;background:#0a2a4a;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#7fb3ff">Preço Bybit • Ref • Entradas LONG • Entradas SHORT</div><div class="small">Trajetoria Bybit: <span id="traj"></span> | Terreno: LIMPO</div><div><b>ORDENS ABERTAS - CONTAGEM</b><div id="contagem"></div></div></div></div>
 <div id="tab-hist" class="hidden"><div class="card"><b>HISTORICO - POR DATA</b><div><label>ESCOLHE O DIA</label><input class="inp" type="date" id="dia"></div><div id="histResumo"></div><div id="hist"></div></div></div>
