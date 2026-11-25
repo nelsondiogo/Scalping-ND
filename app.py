@@ -1,14 +1,13 @@
-# ND-SCALPING V6 - CODIGO LIMPO FINAL
-# Visual antigo exato. Tudo corrigido:
-# 1) Preco REAL Bybit, sem random. Congela se falhar, mostra Fonte: Bybit - Real / Cache.
-# 2) Flutuante AO ENCONTRO: LONG = min(entrada, Preco+Passo), SHORT = max(entrada, Preco-Passo). Segue quando preco foge, para quando preco vem.
-# 3) Sanitizar: LONG PENDING abaixo do preco foge para Preco+Passo. SHORT PENDING acima do preco foge para Preco-Passo. Nunca PENDING fantasma.
-# 4) Sem duplicado: Guardia NAO e terceira ordem. PENDING contraria TRANSFORMA-SE em Guardia a 10 da ativacao. Max 2 ordens (1 ACTIVE + 1 GUARDIA). 3 so com orfa. Deduplica se houver 2 do mesmo lado.
-# 5) Fuga: quando uma ativa, outra foge para Preco -/+ Passo ate ativa fechar. So ativa se afastar 100 da ativa.
-# 6) Recentralizar: se preco fugir >100 da Ref sem ACTIVE, nova Pinca com Ref nova = Preco atual.
-# 7) Trava: vigilancia +0.002, armada Falta<=40% (60% caminho), mostra TRAVA ARMADA, fecha so se voltar abaixo do preco de armacao. Se chegar ao alvo, fecha por Alvo. PENDING=0.0000, Falta 100%.
-# 8) Saldo: verde so se Saldo >= Inicio, vermelho se Saldo < Inicio. POSICAO mostra P&L total = Saldo - Inicio, mesmo com bot parado. Historico -0.7692 = Cofre -0.7692 = Saldo - Inicio. Sem contradicao.
-# 9) Entrada lida da Bybit, Passo fixo dos Ajustes. Saldo Operacao separado da Margem.
+# ND-SCALPING V6 - CODIGO FINAL - PROMPT LIMPO
+# Visual antigo exato. Todas as regras do prompt limpo.
+# FUGA CORRETA - SO UMA MEXE, A OUTRA ESPERA:
+# Se preco DESCE: LONG segue (desce para Preco+Passo), SHORT espera parada.
+# Se preco SOBE: SHORT segue (sobe para Preco-Passo), LONG espera parada.
+# LONG so foge quando preco desce. Nunca foge para cima, nunca foge quando preco sobe, nunca foge depois de ativa.
+# SHORT so foge quando preco sobe. Nunca foge para baixo, nunca foge quando preco desce, nunca foge depois de ativa.
+# PENDING PnL sempre 0.0000. Trava rigida no codigo, arma Falta<=40%, fecha so se voltar abaixo do preco de armacao.
+# Saldo verde so se Saldo>=Inicio, vermelho se <Inicio. POSICAO mostra P&L total = Saldo-Inicio.
+# Preco REAL Bybit, sem random. Congela se falhar, mostra Cache.
 import os, json, time, threading, urllib.request
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
@@ -83,27 +82,37 @@ def bot_loop():
                 state["price"]=p; state["last_update"]=now()
             if state["running"] and state["price"]>0:
                 price=state["price"]; passo=state["settings"]["passo"] or 50; orders=state["orders"]
+                # SEM DUPLICADO: max 1 PENDING por lado
                 for lado in ["LONG","SHORT"]:
                     pend=[x for x in orders if x["tipo"]=="PENDING" and x["lado"]==lado]
                     if len(pend)>1:
                         pend_sorted=sorted(pend, key=lambda x: abs(x["entrada"]-price))
                         for extra in pend_sorted[1:]:
                             orders.remove(extra)
+                # RECENTRALIZAR: preco fugiu >100 da Ref sem ACTIVE -> nova Pinca com Ref = preco atual
                 if abs(price - state["ref"]) > 100 and not any(x["tipo"]=="ACTIVE" for x in orders):
                     state["ref"]=price; state["orders"]=new_pair(price, price, passo); orders=state["orders"]
+                # FUGA / FLUTUANTE - SO UMA MEXE, A OUTRA ESPERA
                 for o in orders:
                     if o["tipo"]=="PENDING":
                         if o["lado"]=="LONG":
-                            nova = round(price + passo, 1)
-                            if nova < o["entrada"]: o["entrada"]=nova; o["alvo"]=round(o["entrada"]+passo,1)
+                            # LONG so foge quando preco DESCE (afasta-se da LONG). Se preco SOBE, LONG espera parada.
+                            alvo_fuga = round(price + passo, 1)
+                            if alvo_fuga < o["entrada"]:
+                                o["entrada"]=alvo_fuga; o["alvo"]=round(o["entrada"]+passo,1)
+                            # Sanitizar: LONG nunca pode ficar abaixo do preco (lado errado)
                             if o["entrada"] <= price:
                                 o["entrada"]=round(price+passo,1); o["alvo"]=round(o["entrada"]+passo,1)
                         else:
-                            nova = round(price - passo, 1)
-                            if nova > o["entrada"]: o["entrada"]=nova; o["alvo"]=round(o["entrada"]-passo,1)
+                            # SHORT so foge quando preco SOBE (afasta-se da SHORT). Se preco DESCE, SHORT espera parada.
+                            alvo_fuga = round(price - passo, 1)
+                            if alvo_fuga > o["entrada"]:
+                                o["entrada"]=alvo_fuga; o["alvo"]=round(o["entrada"]-passo,1)
+                            # Sanitizar: SHORT nunca pode ficar acima do preco
                             if o["entrada"] >= price:
                                 o["entrada"]=round(price-passo,1); o["alvo"]=round(o["entrada"]-passo,1)
                         o["pnl"]=0.0; o["falta"]=100.0; o["trava"]=""
+                # ATIVACAO - SO NO TOQUE
                 for o in list(orders):
                     if o["tipo"]=="PENDING":
                         act = next((x for x in orders if x["tipo"]=="ACTIVE"), None)
@@ -123,12 +132,14 @@ def bot_loop():
                                 ge=round(o["entrada"]+10,1)
                                 if ge <= price: ge=round(price+passo,1)
                                 orders.append({"id":f"G{int(time.time())%10000}","lado":"LONG","tipo":"PENDING","entrada":ge,"alvo":round(ge+passo,1),"pnl":0.0,"falta":100.0,"trava":"","flutuante":True,"origem":"GUARDIA"})
+                # Se 2 ACTIVE, segunda volta a PENDING e foge
                 actives=[x for x in orders if x["tipo"]=="ACTIVE"]
                 if len(actives)>1:
                     for extra in actives[1:]:
                         extra["tipo"]="PENDING"; extra["pnl"]=0.0; extra["falta"]=100.0
                         if extra["lado"]=="LONG": extra["entrada"]=round(price+passo,1); extra["alvo"]=round(extra["entrada"]+passo,1)
                         else: extra["entrada"]=round(price-passo,1); extra["alvo"]=round(extra["entrada"]-passo,1)
+                # MONITOR ACTIVE - TRAVA + ALVO + ORFA CORTE 100
                 for o in list(orders):
                     if o["tipo"]=="ACTIVE":
                         mov=(price-o["entrada"]) if o["lado"]=="LONG" else (o["entrada"]-price)
