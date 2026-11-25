@@ -1,11 +1,14 @@
-# ND-SCALPING V6 - SOLUCAO DO ERRO: FLUTUAR AO ENCONTRO DO PRECO
-# ERRO ANTIGO: LONG so subia, SHORT so descia. Quando o preco vinha ao encontro, a ordem fugia. Quando fugia, ficava parada. Invertido.
-# CORRECAO: PENDING segue quando o preco foge, para quando o preco vem.
-# LONG: se preco desce (foge), LONG desce para Preco+Passo. Se preco sobe (vem), LONG fica parada a espera de ser tocada.
-# SHORT: se preco sobe (foge), SHORT sobe para Preco-Passo. Se preco desce (vem), SHORT fica parada a espera.
-# Implementacao: LONG entrada = min(entrada_antiga, Preco+Passo) ; SHORT entrada = max(entrada_antiga, Preco-Passo)
-# Assim distancia encolhe quando preco vem, ativa. Nunca fica a 646 de distancia.
-# Preco REAL Bybit, sem random. Congela se falhar. Recentralizar so se preco fugir >100 da Ref sem ACTIVE. Fuga: quando uma ativa, outra foge para Preco-/+Passo e so pode ativar se afastar 100 da ativa. Trava: vigilancia +0.002, armada Falta<=40%, fecha so se voltar abaixo do preco de armacao. PENDING=0.0000, Falta 100%. Visual antigo exato.
+# ND-SCALPING V6 - CODIGO LIMPO FINAL
+# Visual antigo exato. Tudo corrigido:
+# 1) Preco REAL Bybit, sem random. Congela se falhar, mostra Fonte: Bybit - Real / Cache.
+# 2) Flutuante AO ENCONTRO: LONG = min(entrada, Preco+Passo), SHORT = max(entrada, Preco-Passo). Segue quando preco foge, para quando preco vem.
+# 3) Sanitizar: LONG PENDING abaixo do preco foge para Preco+Passo. SHORT PENDING acima do preco foge para Preco-Passo. Nunca PENDING fantasma.
+# 4) Sem duplicado: Guardia NAO e terceira ordem. PENDING contraria TRANSFORMA-SE em Guardia a 10 da ativacao. Max 2 ordens (1 ACTIVE + 1 GUARDIA). 3 so com orfa. Deduplica se houver 2 do mesmo lado.
+# 5) Fuga: quando uma ativa, outra foge para Preco -/+ Passo ate ativa fechar. So ativa se afastar 100 da ativa.
+# 6) Recentralizar: se preco fugir >100 da Ref sem ACTIVE, nova Pinca com Ref nova = Preco atual.
+# 7) Trava: vigilancia +0.002, armada Falta<=40% (60% caminho), mostra TRAVA ARMADA, fecha so se voltar abaixo do preco de armacao. Se chegar ao alvo, fecha por Alvo. PENDING=0.0000, Falta 100%.
+# 8) Saldo: verde so se Saldo >= Inicio, vermelho se Saldo < Inicio. POSICAO mostra P&L total = Saldo - Inicio, mesmo com bot parado. Historico -0.7692 = Cofre -0.7692 = Saldo - Inicio. Sem contradicao.
+# 9) Entrada lida da Bybit, Passo fixo dos Ajustes. Saldo Operacao separado da Margem.
 import os, json, time, threading, urllib.request
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
@@ -57,6 +60,21 @@ def close_order(o, exit_price, motivo):
     state["saldo_op"]=round(state["saldo_op"]+pnl,4); state["saldo_total"]=round(state["saldo_total"]+pnl,4); state["cofre_ciclo"]=round(state["cofre_ciclo"]+pnl,4); state["cofre_global"]=round(state["cofre_global"]+pnl,4)
     state["history"].insert(0, {"lado":o["lado"],"tipo":"FLUTUANTE","entrada":o["entrada"],"saida":exit_price,"pnl":pnl,"motivo":motivo,"hora":now(),"origem":o.get("origem","PINCA")})
     state["history"]=state["history"][:200]
+def transformar_em_guardia(orders, lado_ativado, entrada_ativada, passo, price):
+    for out in orders:
+        if out["tipo"]=="PENDING" and out["lado"]!=lado_ativado:
+            out["origem"]="GUARDIA"
+            if out["lado"]=="LONG":
+                g = round(entrada_ativada+10,1)
+                if g <= price: g = round(price+passo,1)
+                out["entrada"]=g; out["alvo"]=round(g+passo,1)
+            else:
+                g = round(entrada_ativada-10,1)
+                if g >= price: g = round(price-passo,1)
+                out["entrada"]=g; out["alvo"]=round(g-passo,1)
+            out["pnl"]=0.0; out["falta"]=100.0; out["trava"]=""
+            return True
+    return False
 def bot_loop():
     while True:
         try:
@@ -65,53 +83,52 @@ def bot_loop():
                 state["price"]=p; state["last_update"]=now()
             if state["running"] and state["price"]>0:
                 price=state["price"]; passo=state["settings"]["passo"] or 50; orders=state["orders"]
-                # RECENTRALIZAR so se sem ACTIVE e preco fugiu >100 da Ref
+                for lado in ["LONG","SHORT"]:
+                    pend=[x for x in orders if x["tipo"]=="PENDING" and x["lado"]==lado]
+                    if len(pend)>1:
+                        pend_sorted=sorted(pend, key=lambda x: abs(x["entrada"]-price))
+                        for extra in pend_sorted[1:]:
+                            orders.remove(extra)
                 if abs(price - state["ref"]) > 100 and not any(x["tipo"]=="ACTIVE" for x in orders):
                     state["ref"]=price; state["orders"]=new_pair(price, price, passo); orders=state["orders"]
-                # === FLUTUANTE CORRIGIDO: segue quando preco foge, para quando preco vem ===
                 for o in orders:
                     if o["tipo"]=="PENDING":
                         if o["lado"]=="LONG":
-                            # LONG acima: se preco desceu, desce atras para Preco+Passo. Se preco subiu, NAO sobe, fica parada a espera.
                             nova = round(price + passo, 1)
-                            if nova < o["entrada"]:
-                                o["entrada"]=nova; o["alvo"]=round(o["entrada"]+passo,1)
+                            if nova < o["entrada"]: o["entrada"]=nova; o["alvo"]=round(o["entrada"]+passo,1)
+                            if o["entrada"] <= price:
+                                o["entrada"]=round(price+passo,1); o["alvo"]=round(o["entrada"]+passo,1)
                         else:
-                            # SHORT abaixo: se preco subiu, sobe atras para Preco-Passo. Se preco desceu, NAO desce, fica parada a espera.
                             nova = round(price - passo, 1)
-                            if nova > o["entrada"]:
-                                o["entrada"]=nova; o["alvo"]=round(o["entrada"]-passo,1)
+                            if nova > o["entrada"]: o["entrada"]=nova; o["alvo"]=round(o["entrada"]-passo,1)
+                            if o["entrada"] >= price:
+                                o["entrada"]=round(price-passo,1); o["alvo"]=round(o["entrada"]-passo,1)
                         o["pnl"]=0.0; o["falta"]=100.0; o["trava"]=""
-                # ATIVACAO
                 for o in list(orders):
                     if o["tipo"]=="PENDING":
-                        # Se ha ACTIVE, PENDING fugida so pode ativar se preco afastar 100 da ativa
                         act = next((x for x in orders if x["tipo"]=="ACTIVE"), None)
                         if act is not None and abs(price - act["entrada"]) < 100:
                             continue
                         if o["lado"]=="LONG" and price>=o["entrada"]:
                             o["tipo"]="ACTIVE"; o["best"]=price; o["armado_em"]=None; o["armado"]=False
-                            for out in orders:
-                                if out is not o and out["tipo"]=="PENDING":
-                                    if out["lado"]=="SHORT": out["entrada"]=round(price-passo,1); out["alvo"]=round(out["entrada"]-passo,1)
-                                    else: out["entrada"]=round(price+passo,1); out["alvo"]=round(out["entrada"]+passo,1)
-                            if not any(x.get("origem")=="GUARDIA" and x["lado"]!=o["lado"] for x in orders):
-                                ge=round(o["entrada"]-10,1); orders.append({"id":f"G{int(time.time())%10000}","lado":"SHORT","tipo":"PENDING","entrada":ge,"alvo":round(ge-passo,1),"pnl":0.0,"falta":100.0,"trava":"","flutuante":True,"origem":"GUARDIA"})
+                            ok = transformar_em_guardia(orders, "LONG", o["entrada"], passo, price)
+                            if not ok:
+                                ge=round(o["entrada"]-10,1)
+                                if ge >= price: ge=round(price-passo,1)
+                                orders.append({"id":f"G{int(time.time())%10000}","lado":"SHORT","tipo":"PENDING","entrada":ge,"alvo":round(ge-passo,1),"pnl":0.0,"falta":100.0,"trava":"","flutuante":True,"origem":"GUARDIA"})
                         elif o["lado"]=="SHORT" and price<=o["entrada"]:
                             o["tipo"]="ACTIVE"; o["best"]=price; o["armado_em"]=None; o["armado"]=False
-                            for out in orders:
-                                if out is not o and out["tipo"]=="PENDING":
-                                    if out["lado"]=="LONG": out["entrada"]=round(price+passo,1); out["alvo"]=round(out["entrada"]+passo,1)
-                                    else: out["entrada"]=round(price-passo,1); out["alvo"]=round(out["entrada"]-passo,1)
-                            if not any(x.get("origem")=="GUARDIA" and x["lado"]!=o["lado"] for x in orders):
-                                ge=round(o["entrada"]+10,1); orders.append({"id":f"G{int(time.time())%10000}","lado":"LONG","tipo":"PENDING","entrada":ge,"alvo":round(ge+passo,1),"pnl":0.0,"falta":100.0,"trava":"","flutuante":True,"origem":"GUARDIA"})
+                            ok = transformar_em_guardia(orders, "SHORT", o["entrada"], passo, price)
+                            if not ok:
+                                ge=round(o["entrada"]+10,1)
+                                if ge <= price: ge=round(price+passo,1)
+                                orders.append({"id":f"G{int(time.time())%10000}","lado":"LONG","tipo":"PENDING","entrada":ge,"alvo":round(ge+passo,1),"pnl":0.0,"falta":100.0,"trava":"","flutuante":True,"origem":"GUARDIA"})
                 actives=[x for x in orders if x["tipo"]=="ACTIVE"]
                 if len(actives)>1:
                     for extra in actives[1:]:
                         extra["tipo"]="PENDING"; extra["pnl"]=0.0; extra["falta"]=100.0
                         if extra["lado"]=="LONG": extra["entrada"]=round(price+passo,1); extra["alvo"]=round(extra["entrada"]+passo,1)
                         else: extra["entrada"]=round(price-passo,1); extra["alvo"]=round(extra["entrada"]-passo,1)
-                # ACTIVE
                 for o in list(orders):
                     if o["tipo"]=="ACTIVE":
                         mov=(price-o["entrada"]) if o["lado"]=="LONG" else (o["entrada"]-price)
@@ -146,7 +163,7 @@ HTML='''
 </style></head><body>
 <div class="top"><b>ND-SCALPING</b> <span class="papel">PAPEL</span><div class="small">Atualizado: <span id="upd">--</span> | Fonte: <span id="fonte">--</span> | Sem chaves - virtual</div></div>
 <div id="tab-dash">
-<div class="card"><b>STATUS - ANALISE BYBIT</b><div id="status"></div><div style="display:flex;gap:10px;margin-top:10px"><div><div class="small">SALDO TOTAL DA CONTA</div><div class="big green" id="saldoTotal">--</div></div><div><div class="small">SALDO EM OPERACAO</div><div class="big green" id="saldoOp">--</div></div></div><div class="small">So muda ao fechar a operacao | Inicio: <span id="saldoInicio"></span></div></div>
+<div class="card"><b>STATUS - ANALISE BYBIT</b><div id="status"></div><div style="display:flex;gap:10px;margin-top:10px"><div><div class="small">SALDO TOTAL DA CONTA</div><div class="big" id="saldoTotal">--</div></div><div><div class="small">SALDO EM OPERACAO</div><div class="big" id="saldoOp">--</div></div></div><div class="small">So muda ao fechar a operacao | Inicio: <span id="saldoInicio"></span> | P&L total: <span id="pnlTotal"></span></div></div>
 <div class="card"><b>POSICAO ATUAL - AO VIVO</b><div id="pos"></div><button id="mainBtn" class="btn btn-start" onclick="toggle()">INICIAR BOT</button></div>
 <div class="card"><b>GRID — REF NO CENTRO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">Trava rigida: arma a +0.002, armada a Falta &lt;=40% — fecha so se voltar abaixo do preco de armacao.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
 </div>
@@ -166,7 +183,7 @@ HTML='''
 <script>
 let S={};
 function tab(n,el){['dash','merc','hist','aj'].forEach(x=>document.getElementById('tab-'+x).classList.toggle('hidden',x!==n));document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));el.classList.add('on')}
-async function load(){let r=await fetch('/api/state');S=await r.json();document.getElementById('upd').textContent=S.last_update;document.getElementById('fonte').textContent=S.fonte;document.getElementById('saldoTotal').textContent=S.saldo_total.toFixed(4);document.getElementById('saldoOp').textContent=S.saldo_op.toFixed(4);document.getElementById('saldoInicio').textContent=S.saldo_op_inicio;document.getElementById('status').innerHTML=`<div class="${S.running?'green':'red'}">${S.running?'A OPERAR':'PARADO'}</div><div class="small">Par: BTC/USDT:USDT | Preco Bybit: ${S.price} | Ref: ${S.ref} | Modo: PAPEL</div><div style="background:#12331f;padding:6px;border-radius:6px;margin-top:6px">LIMPO - Preco ${S.price} perto da media ${S.ref}.</div>`;document.getElementById('pos').innerHTML=`<div>Preco Bybit: ${S.price} | Ref: ${S.ref} | Entrada escolhida pelo robo: ${S.ref}</div><div class="big ${S.pnl>=0?'green':'red'}">${S.pnl}</div><div>Cofre ciclo: ${S.cofre_ciclo} | Cofre global: ${S.cofre_global} | Cofre orfa: ${S.cofre_orfa}</div><div>Saldo da operacao: ${S.saldo_op} USDT | Em uso: ${S.em_uso} / ${S.saldo_op} USDT</div>`;document.getElementById('refbar').textContent=`Ref: ${S.ref} • Preço: ${S.price}`;document.getElementById('merc').innerHTML=`Preco Bybit: ${S.price} | Ref: ${S.ref} | Moeda: BTC`;document.getElementById('traj').textContent=S.trajetoria;document.getElementById('contagem').textContent=`${S.orders.length} ordens | ${S.orders.filter(o=>o.tipo==='ACTIVE').length} ACTIVE | ${S.orders.filter(o=>o.tipo==='PENDING').length} PENDING`;let sh=S.orders.filter(o=>o.lado==='SHORT').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem==='GUARDIA'?'• GUARDIA':''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>${o.entrada} → ${o.alvo} • ${o.pnl.toFixed(4)}<br>Falta ${o.falta}% para o alvo</div>`).join('')||'—';let lo=S.orders.filter(o=>o.lado==='LONG').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem==='GUARDIA'?'• GUARDIA':''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>${o.entrada} → ${o.alvo} • ${o.pnl.toFixed(4)}<br>Falta ${o.falta}% para o alvo</div>`).join('')||'—';document.getElementById('shorts').innerHTML=sh;document.getElementById('longs').innerHTML=lo;let btn=document.getElementById('mainBtn');btn.textContent=S.running?'PARAR ROBÔ':'INICIAR BOT';btn.className='btn '+(S.running?'btn-stop':'btn-start');let h=S.history;let tot=h.reduce((a,b)=>a+b.pnl,0);document.getElementById('histResumo').innerHTML=`<div class="big ${tot>=0?'green':'red'}">${tot>=0?'+':''}${tot.toFixed(4)} USDT</div><div class="small">Percentagem sobre saldo da operacao | LONG: ${h.filter(x=>x.lado==='LONG').reduce((a,b)=>a+b.pnl,0).toFixed(4)} | ${h.filter(x=>x.lado==='LONG').length} ordens | SHORT: ${h.filter(x=>x.lado==='SHORT').reduce((a,b)=>a+b.pnl,0).toFixed(4)} | ${h.filter(x=>x.lado==='SHORT').length} ordens</div>`;document.getElementById('hist').innerHTML=h.map(x=>`<div class="histline">${x.lado} FLUTUANTE | ${x.hora} | ${x.pnl>=0?'+':''}${x.pnl} USDT<br>${x.entrada} → ${x.saida} • ${x.motivo}</div>`).join('');if(!document.getElementById('f_saldo_op').value){document.getElementById('f_saldo_op').value=S.settings.saldo_op;document.getElementById('f_margem').value=S.settings.margem;document.getElementById('f_alav').value=S.settings.alav;document.getElementById('f_passo').value=S.settings.passo;document.getElementById('f_total').value=S.settings.total_ordens;document.getElementById('f_lucro').value=S.settings.lucro_op;document.getElementById('f_modo').value=S.settings.modo;document.getElementById('f_ops').value=S.settings.ops_dia;}}
+async function load(){let r=await fetch('/api/state');S=await r.json();document.getElementById('upd').textContent=S.last_update;document.getElementById('fonte').textContent=S.fonte;let corTotal=S.saldo_total>=S.saldo_op_inicio?'green':'red';let corOp=S.saldo_op>=S.saldo_op_inicio?'green':'red';let st=document.getElementById('saldoTotal');st.textContent=S.saldo_total.toFixed(4);st.className='big '+corTotal;let so=document.getElementById('saldoOp');so.textContent=S.saldo_op.toFixed(4);so.className='big '+corOp;document.getElementById('saldoInicio').textContent=S.saldo_op_inicio;let pnlTot=S.saldo_op - S.saldo_op_inicio;let pt=document.getElementById('pnlTotal');pt.textContent=(pnlTot>=0?'+':'')+pnlTot.toFixed(4)+' USDT';pt.className=pnlTot>=0?'green':'red';document.getElementById('status').innerHTML=`<div class="${S.running?'green':'red'}">${S.running?'A OPERAR':'PARADO'}</div><div class="small">Par: BTC/USDT:USDT | Preco Bybit: ${S.price} | Ref: ${S.ref} | Modo: PAPEL</div><div style="background:#12331f;padding:6px;border-radius:6px;margin-top:6px">LIMPO - Preco ${S.price} perto da media ${S.ref}.</div>`;document.getElementById('pos').innerHTML=`<div>Preco Bybit: ${S.price} | Ref: ${S.ref} | Entrada escolhida pelo robo: ${S.ref}</div><div class="big ${pnlTot>=0?'green':'red'}">${pnlTot>=0?'+':''}${pnlTot.toFixed(4)} USDT — P&L total (Saldo - Inicio)</div><div class="small">P&L vivo ACTIVE: ${S.pnl.toFixed(4)} | Cofre ciclo: ${S.cofre_ciclo} | Cofre global: ${S.cofre_global} | Cofre orfa: ${S.cofre_orfa}</div><div>Saldo da operacao: ${S.saldo_op} USDT | Em uso: ${S.em_uso} / ${S.saldo_op} USDT</div>`;document.getElementById('refbar').textContent=`Ref: ${S.ref} • Preço: ${S.price}`;document.getElementById('merc').innerHTML=`Preco Bybit: ${S.price} | Ref: ${S.ref} | Moeda: BTC`;document.getElementById('traj').textContent=S.trajetoria;document.getElementById('contagem').textContent=`${S.orders.length} ordens | ${S.orders.filter(o=>o.tipo==='ACTIVE').length} ACTIVE | ${S.orders.filter(o=>o.tipo==='PENDING').length} PENDING`;let sh=S.orders.filter(o=>o.lado==='SHORT').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem==='GUARDIA'?'• GUARDIA':''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>${o.entrada} → ${o.alvo} • ${o.pnl.toFixed(4)}<br>Falta ${o.falta}% para o alvo</div>`).join('')||'—';let lo=S.orders.filter(o=>o.lado==='LONG').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem==='GUARDIA'?'• GUARDIA':''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>${o.entrada} → ${o.alvo} • ${o.pnl.toFixed(4)}<br>Falta ${o.falta}% para o alvo</div>`).join('')||'—';document.getElementById('shorts').innerHTML=sh;document.getElementById('longs').innerHTML=lo;let btn=document.getElementById('mainBtn');btn.textContent=S.running?'PARAR ROBÔ':'INICIAR BOT';btn.className='btn '+(S.running?'btn-stop':'btn-start');let h=S.history;let tot=h.reduce((a,b)=>a+b.pnl,0);document.getElementById('histResumo').innerHTML=`<div class="big ${tot>=0?'green':'red'}">${tot>=0?'+':''}${tot.toFixed(4)} USDT</div><div class="small">Percentagem sobre saldo da operacao | LONG: ${h.filter(x=>x.lado==='LONG').reduce((a,b)=>a+b.pnl,0).toFixed(4)} | ${h.filter(x=>x.lado==='LONG').length} ordens | SHORT: ${h.filter(x=>x.lado==='SHORT').reduce((a,b)=>a+b.pnl,0).toFixed(4)} | ${h.filter(x=>x.lado==='SHORT').length} ordens</div>`;document.getElementById('hist').innerHTML=h.map(x=>`<div class="histline">${x.lado} FLUTUANTE | ${x.hora} | ${x.pnl>=0?'+':''}${x.pnl} USDT<br>${x.entrada} → ${x.saida} • ${x.motivo}</div>`).join('');if(!document.getElementById('f_saldo_op').value){document.getElementById('f_saldo_op').value=S.settings.saldo_op;document.getElementById('f_margem').value=S.settings.margem;document.getElementById('f_alav').value=S.settings.alav;document.getElementById('f_passo').value=S.settings.passo;document.getElementById('f_total').value=S.settings.total_ordens;document.getElementById('f_lucro').value=S.settings.lucro_op;document.getElementById('f_modo').value=S.settings.modo;document.getElementById('f_ops').value=S.settings.ops_dia;}}
 async function toggle(){await fetch('/api/toggle',{method:'POST'});load()}
 async function salvar(){let b={saldo_op:parseFloat(document.getElementById('f_saldo_op').value),margem:parseFloat(document.getElementById('f_margem').value),alav:parseFloat(document.getElementById('f_alav').value),passo:parseFloat(document.getElementById('f_passo').value),total_ordens:parseFloat(document.getElementById('f_total').value),lucro_op:parseFloat(document.getElementById('f_lucro').value),modo:document.getElementById('f_modo').value,ops_dia:parseFloat(document.getElementById('f_ops').value)};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert('Guardado');load()}
 setInterval(load,1500);load();
