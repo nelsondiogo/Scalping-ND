@@ -1,20 +1,23 @@
-# ND-SCALPING V6 - CODIGO LIMPO E REFINADO
-# Visual antigo exato. Dashboard / Mercado / Historico / Ajustes.
-# REGRAS: Grid finito 5 LONG + 5 SHORT, total = N Total Ordens. 1 fecha = 1 nasce. Mesma margem, mesmo passo.
+# ND-SCALPING V6 - SEM PROTECAO ANTECIPADA - PERFORMANCE INSTITUCIONAL
+# Estrategia original, sem igual em futuros crypto. Lucrar sem margem de erros.
+# REGRA DURA: SEM FECHO POR PROTECAO. Negativa NUNCA fecha por estar negativa.
+# Negativa so fecha: 1) virou positiva e bateu na trava, 2) encerramento e Total >= Alvo.
+# Grid finito 5 LONG + 5 SHORT, total = N Total Ordens. 1 fecha = 1 nasce. Mesma margem, mesmo passo.
 # Trava 60%, recuo 10% antes do alvo, 15% depois, lucro ao infinito.
-# Saldos: Conta != Operacao. Reserva = Conta - Operacao. Cofre Operacao = soma PnL. Cofre Global = Conta anterior + PnL.
-# Margem necessaria = Valor Ordem (ate 5 USDT) / Alavancagem. Ex: 5/15=0.33. Abre mesmo com saldo <1 se Livre >= Margem necessaria.
+# Saldos: Conta != Operacao. Reserva = Conta - Operacao. Cofre Op = soma PnL. Cofre Global = Conta anterior + PnL.
+# Margem necessaria = Valor Ordem (ate 5 USDT) / Alavancagem. Ex: 5/15=0.33. Abre mesmo com saldo <1 se Livre >= Margem.
 # Taxa real Bybit 0.055% por lado (0.11% ida-volta). Slippage 1-2 pontos contra. Atraso 1.5-2.5s na ativacao.
 # Paragem: Manual alvo = Lucro por Operacao. Automatico alvo = Lucro x Operacoes (ex 5x8=40), sabe desde o inicio.
-# Ao atingir alvo: para de abrir novas, espera ACTIVE lucrar fecharem, negativas ficam a espera, so fecha negativa se Total >= Alvo.
-# LONG + SHORT = Total, com contador total desde INICIAR, nunca so ultimas 200.
+# Ao atingir alvo: para de abrir novas, espera ACTIVE fecharem, negativas ficam a espera, so fecha negativa se Total >= Alvo.
+# LONG + SHORT = Total, contador total desde INICIAR, nunca so ultimas 200.
 # Ajustes preenchem 1 vez, nao apagam enquanto escreves, so mudam no GUARDAR.
 # Preco REAL Bybit, nunca random. Hora Luanda +1. Ref parado = Preco atual, nunca 0.
+# SEM duplicadas. SEM abrir sem margem. SEM abrir alem do teto. SEM fechar negativa por medo.
 import os, json, time, threading, random, urllib.request
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template_string
 app = Flask(__name__)
-DATA_FILE = "/tmp/nd_v6_limpo.json"
+DATA_FILE = "/tmp/nd_v6_sem_protecao.json"
 def now(): return (datetime.utcnow() + timedelta(hours=1)).strftime("%H:%M:%S")
 def load():
     try:
@@ -25,7 +28,7 @@ def save(s):
         with open(DATA_FILE,"w") as f: json.dump(s,f)
     except: pass
 def default_state():
-    return {"running":False,"price":0.0,"ref":0.0,"saldo_conta":100.0,"saldo_conta_inicio":100.0,"saldo_op":25.0,"saldo_op_inicio":25.0,"em_uso":0.0,"reserva":75.0,"cofre_op":0.0,"cofre_global":100.0,"cofre_orfa":0.0,"pnl_acumulado":0.0,"pnl_long":0.0,"pnl_short":0.0,"orders":[],"history":[],"encerramento":False,"alvo_total":0.0,"settings":{"saldo_conta":100.0,"saldo_op":25.0,"margem":5.0,"alav":15,"passo":25,"total_ordens":10,"lucro_op":5,"modo":"Manual","ops_dia":8},"last_update":"--","fonte":"Bybit - a ligar...","trajetoria":"a descer","pausa_orfa":0}
+    return {"running":False,"price":0.0,"ref":0.0,"saldo_conta":100.0,"saldo_conta_inicio":100.0,"saldo_op":25.0,"saldo_op_inicio":25.0,"em_uso":0.0,"reserva":75.0,"cofre_op":0.0,"cofre_global":100.0,"cofre_orfa":0.0,"pnl_acumulado":0.0,"pnl_long":0.0,"pnl_short":0.0,"orders":[],"history":[],"encerramento":False,"alvo_total":0.0,"settings":{"saldo_conta":100.0,"saldo_op":25.0,"margem":5.0,"alav":15,"passo":25,"total_ordens":10,"lucro_op":5,"modo":"Manual","ops_dia":8},"last_update":"--","fonte":"Bybit - a ligar...","trajetoria":"a descer"}
 state = load() or default_state()
 LAST_REAL = [state.get("price") or 0.0]
 def fetch_bybit_price():
@@ -38,7 +41,6 @@ def fetch_bybit_price():
         except Exception as e: print("bybit fail",e); continue
     state["fonte"]="Bybit - Cache (ultimo preco real)"; return LAST_REAL[0] or state.get("price") or 0.0
 def margem_necessaria():
-    # Valor ordem ate 5 USDT / Alavancagem. Ex: 5/15=0.33
     valor = min(float(state["settings"].get("margem") or 5.0), 5.0)
     alav = float(state["settings"].get("alav") or 15)
     if alav<=0: alav=1
@@ -58,8 +60,7 @@ def build_grid(price, passo):
         refS=price-(i+1)*passo; orders.append({"id":f"S{i+1}","lado":"SHORT","tipo":"PENDING","ref":round(refS,1),"entrada":round(refS,1),"alvo":round(refS-passo,1),"pnl":0.0,"falta":100.0,"trava":"","flutuante":True,"origem":"GRID","best":None,"armado":False,"armado_em":None,"passou_alvo":False,"ativar_em":None,"preco_fill":None})
     return orders
 def total_max(): return int(state["settings"].get("total_ordens") or 10)
-def saldo_livre():
-    return round(state["saldo_op"] - state.get("em_uso",0),4)
+def saldo_livre(): return round(state["saldo_op"] - state.get("em_uso",0),4)
 def add_order_keep_cap(new_o):
     if state.get("encerramento"): return False
     if len(state["orders"])>=total_max():
@@ -70,12 +71,10 @@ def add_order_keep_cap(new_o):
     state["orders"].append(new_o); return True
 def close_order(o, exit_price, motivo):
     passo=state["settings"]["passo"] or 25
-    # Slippage no fecho: 1-2 pontos contra tambem
     slip = random.uniform(1,2)
     if o["lado"]=="LONG": exit_price=round(exit_price-slip,1)
     else: exit_price=round(exit_price+slip,1)
     mov=(exit_price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-exit_price)
-    # PnL bruto proporcional ao movimento, taxa real 0.055% x 2 sobre valor ordem (ate 5)
     valor=min(float(state["settings"].get("margem") or 5.0),5.0)
     taxa=valor*0.00055*2
     pnl_bruto=round((mov/passo)*float(state["settings"].get("lucro_op") or 5)*0.012,4) if passo else 0.0
@@ -86,7 +85,6 @@ def close_order(o, exit_price, motivo):
     else: state["pnl_short"]=round(state.get("pnl_short",0)+pnl,4)
     state["saldo_op"]=round(state["saldo_op_inicio"]+state["pnl_acumulado"],4)
     state["cofre_op"]=round(state["pnl_acumulado"],4)
-    # Saldo Conta = Conta inicio + PnL total. Reserva = Conta - Operacao. Cofre Global = Conta anterior + PnL desta ordem
     state["cofre_global"]=round(state["saldo_conta"]+pnl,4)
     state["saldo_conta"]=round(state["saldo_conta_inicio"]+state["pnl_acumulado"],4)
     state["reserva"]=round(state["saldo_conta"]-state["saldo_op"],4)
@@ -104,33 +102,27 @@ def bot_loop():
             if not state["running"]: state["ref"]=p
             if state["running"] and state["price"]>0:
                 price=state["price"]; passo=state["settings"]["passo"] or 25; orders=state["orders"]
-                # Dedup + teto
                 seen=set(); uniq=[]
                 for o in orders:
                     k=(o["lado"],o["ref"],o["tipo"])
                     if k in seen: continue
                     seen.add(k); uniq.append(o)
                 state["orders"]=uniq[:total_max()]; orders=state["orders"]
-                # Verifica alvo -> entra em ENCERRAMENTO, para de abrir novas
                 alvo=alvo_total(); state["alvo_total"]=alvo
                 if state["pnl_acumulado"]>=alvo and alvo>0: state["encerramento"]=True
-                # ATIVACAO com atraso 1.5-2.5s + slippage 1-2 contra + margem com alavancagem
                 mn=margem_necessaria()
                 for o in list(orders):
                     if o["tipo"]=="PENDING":
                         if state.get("encerramento"): o["pnl"]=0.0; o["falta"]=100.0; continue
                         toca=(o["lado"]=="LONG" and price>=o["ref"]) or (o["lado"]=="SHORT" and price<=o["ref"])
-                        if toca and not o.get("ativar_em"):
-                            o["ativar_em"]=time.time()+random.uniform(1.5,2.5)
+                        if toca and not o.get("ativar_em"): o["ativar_em"]=time.time()+random.uniform(1.5,2.5)
                         if toca and o.get("ativar_em") and time.time()>=o["ativar_em"]:
-                            # Margem: so ativa se Livre >= Margem necessaria
                             if saldo_livre()>=mn:
-                                slip=random.uniform(1,2)
-                                fill=round(price+slip,1) if o["lado"]=="LONG" else round(price-slip,1)
+                                slip=random.uniform(1,2); fill=round(price+slip,1) if o["lado"]=="LONG" else round(price-slip,1)
                                 o["tipo"]="ACTIVE"; o["preco_fill"]=fill; o["best"]=fill; o["armado"]=False; o["armado_em"]=None; o["ativar_em"]=None
                             else: o["ativar_em"]=None
                         elif not toca: o["ativar_em"]=None; o["pnl"]=0.0; o["falta"]=100.0; o["trava"]=""
-                # MONITOR ACTIVE
+                # MONITOR ACTIVE - SEM PROTECAO ANTECIPADA. Negativa fica a espera.
                 for o in list(orders):
                     if o["tipo"]=="ACTIVE":
                         mov=(price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-price)
@@ -152,30 +144,21 @@ def bot_loop():
                                     if not state.get("encerramento"): add_order_keep_cap(born_opposite(price,o["lado"],passo))
                                     break
                         else:
-                            # Negativa: fica a espera. So fecha por protecao -1 Passo se Total ficar >= Alvo
-                            if mov < -passo:
-                                # Simula: se fechar agora, total fica >= alvo?
-                                total_se_fechar=state["pnl_acumulado"]+o["pnl"]
-                                if total_se_fechar>=alvo or not state.get("encerramento"):
-                                    close_order(o,price,"Protecao -1 Passo"); orders.remove(o)
-                                    if not state.get("encerramento"): add_order_keep_cap(born_opposite(price,o["lado"],passo))
-                                    break
-                                else:
-                                    # Nao fecha abaixo do alvo. Fica a espera.
-                                    pass
-                # ENCERRAMENTO: se nao ha ACTIVE, encerra total com >= alvo
+                            # NEGATIVA: FICA A ESPERA. Nao fecha por protecao. Nao fecha por medo.
+                            # So fecha em encerramento se Total >= Alvo, tratado abaixo.
+                            o["trava"]="A ESPERA - NAO FECHA NEGATIVA"
+                            pass
                 if state.get("encerramento"):
                     ativos=[x for x in orders if x["tipo"]=="ACTIVE"]
                     if not ativos:
                         state["running"]=False; state["orders"]=[]; state["ref"]=state["price"]; save(state)
                     else:
-                        # Se negativas podem fechar e total ficar >= alvo, fecha-as
                         for o in list(ativos):
                             if o["pnl"]<0:
                                 total_se=state["pnl_acumulado"]+o["pnl"]
                                 if total_se>=alvo:
                                     close_order(o,price,"Encerramento - cobre negativa"); orders.remove(o); break
-                # ULTIMA ORDEM: troca, nao soma. So se nao esta em encerramento.
+                                # Se nao cobre, fica a espera. Nao fecha abaixo do alvo.
                 if orders and not state.get("encerramento"):
                     longs=[x for x in orders if x["lado"]=="LONG"]; shorts=[x for x in orders if x["lado"]=="SHORT"]
                     if longs:
@@ -210,11 +193,11 @@ HTML='''
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ND-SCALPING</title><style>
 *{box-sizing:border-box}body{margin:0;background:#0f1115;color:#fff;font-family:Arial,sans-serif;padding-bottom:90px}.top{background:#1a1d24;padding:10px 12px;position:sticky;top:0}.top b{color:#2ecc71;font-size:22px}.papel{color:#ff8c00;font-weight:bold}.small{color:#aaa;font-size:12px}.card{background:#1a1d24;margin:10px;border-radius:10px;padding:12px}.green{color:#2ecc71}.red{color:#e74c3c}.big{font-size:26px;font-weight:bold}.grid{display:flex;gap:8px}.box{flex:1;border-radius:8px;padding:8px}.short{background:#3a1414}.long{background:#12331f}.refbar{background:#f1c40f;color:#000;text-align:center;padding:6px;border-radius:6px;font-weight:bold;margin:8px 0}.ord{border-bottom:1px solid #333;padding:6px 0;font-size:13px}.btn{width:100%;padding:14px;border:0;border-radius:8px;font-weight:bold;font-size:16px;cursor:pointer}.btn-start{background:#2ecc71;color:#fff}.btn-stop{background:#e74c3c;color:#fff}.btn-save{background:#3498db;color:#fff;padding:12px}.inp{width:100%;padding:10px;border-radius:6px;border:1px solid #333;background:#0f1115;color:#fff;margin:4px 0 10px}label{font-size:13px;color:#ddd}.tabs{position:fixed;bottom:0;left:0;right:0;display:flex;background:#1a1d24;border-top:1px solid #333}.tabs button{flex:1;padding:14px;background:none;border:0;color:#aaa;font-weight:bold}.tabs button.on{color:#2ecc71}.hidden{display:none}.trava{color:#f1c40f;font-size:11px}.histline{border-bottom:1px solid #333;padding:6px 0;font-size:13px}.enc{background:#f1c40f;color:#000;padding:6px;border-radius:6px;font-weight:bold;text-align:center;margin-top:6px}
 </style></head><body>
-<div class="top"><b>ND-SCALPING</b> <span class="papel">PAPEL</span><div class="small">Atualizado: <span id="upd">--</span> | Fonte: <span id="fonte">--</span> | Simulação Real Bybit - Taxa 0.055% | Slippage 1-2 | Atraso 1.5-2.5s</div></div>
+<div class="top"><b>ND-SCALPING</b> <span class="papel">PAPEL</span><div class="small">Atualizado: <span id="upd">--</span> | Fonte: <span id="fonte">--</span> | Simulação Real Bybit - Taxa 0.055% | Slippage 1-2 | Atraso 1.5-2.5s | SEM PROTECAO ANTECIPADA</div></div>
 <div id="tab-dash">
 <div class="card"><b>STATUS - ANALISE BYBIT</b><div id="status"></div><div id="encBox"></div><div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap"><div><div class="small">SALDO TOTAL DA CONTA</div><div class="big" id="saldoConta">--</div></div><div><div class="small">SALDO EM OPERACAO</div><div class="big" id="saldoOp">--</div></div><div><div class="small">RESERVA</div><div class="big" id="reserva">--</div></div></div><div class="small">Conta = Inicio Conta +/- PnL | Operacao = Inicio Op +/- PnL | Reserva = Conta - Operacao | Cofre Op = <span id="cofreOp"></span> | Cofre Global = <span id="cofreG"></span> | Margem necess. = <span id="margNec"></span> | Alvo = <span id="alvoTxt"></span></div></div>
 <div class="card"><b>POSICAO ATUAL - AO VIVO</b><div id="pos"></div><button id="mainBtn" class="btn btn-start" onclick="toggle()">INICIAR BOT</button></div>
-<div class="card"><b>GRID — REF NO CENTRO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">Grid finito: total = N programado. 1 fecha = 1 nasce. Trava 60%. Recuo 10% antes, 15% depois. Infinito.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
+<div class="card"><b>GRID — REF NO CENTRO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">Grid finito: total = N programado. 1 fecha = 1 nasce. Trava 60%. Recuo 10% antes, 15% depois. Infinito. SEM PROTECAO - Negativa fica a espera.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
 </div>
 <div id="tab-merc" class="hidden"><div class="card"><b>MERCADO - GRAFICO BYBIT</b><div id="merc"></div><div style="position:relative;height:160px;background:#0a2a4a;border-radius:8px;overflow:hidden;margin:8px 0"><div id="priceLine" style="position:absolute;left:0;right:0;height:2px;background:#fff"></div><div id="refLine" style="position:absolute;left:0;right:0;height:2px;background:#f1c40f"></div><div id="ordDots"></div><div id="priceLabel" style="position:absolute;right:6px;background:#fff;color:#000;padding:2px 6px;border-radius:4px;font-size:12px;font-weight:bold"></div></div><div class="small">Linha branca = Preço (varia com o preço) | Linha amarela = Ref | Verde = LONG ativa | Vermelho = SHORT ativa | Trajetoria: <span id="traj"></span></div><div><b>ORDENS ABERTAS - CONTAGEM</b><div id="contagem"></div></div></div></div>
 <div id="tab-hist" class="hidden"><div class="card"><b>HISTORICO - POR DATA</b><div><label>ESCOLHE O DIA</label><input class="inp" type="date" id="dia"></div><div id="histResumo"></div><div id="hist"></div></div></div>
@@ -257,7 +240,6 @@ def toggle():
 @app.route("/api/settings",methods=["POST"])
 def settings():
     d=request.get_json(force=True); state["settings"].update(d)
-    # So no GUARDAR: aplica. Nao apaga enquanto escreves porque o JS so preenche 1 vez.
     state["saldo_conta"]=d.get("saldo_conta",state["saldo_conta"]); state["saldo_conta_inicio"]=state["saldo_conta"]; state["saldo_op"]=d.get("saldo_op",state["saldo_op"]); state["saldo_op_inicio"]=state["saldo_op"]; state["reserva"]=round(state["saldo_conta"]-state["saldo_op"],4); state["cofre_global"]=state["saldo_conta"]; state["alvo_total"]=alvo_total()
     save(state); return jsonify({"ok":True})
 if __name__=="__main__":
