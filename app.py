@@ -1,19 +1,19 @@
-# ND-SCALPING V6 - GRID DE REBALANCEAMENTO - MAQUINA DE VENDA CONSTANTE
-# Visual antigo exato. Regras limpas do grid.
-# 10 ordens: 5 LONG + 5 SHORT. Cada ordem tem ref + preco. Lucro = intervalo ref->preco.
-# Nenhuma nasce ativa. Respiro 25 (Passo): ref a 1 Passo do preco inicial, preco a 2 Passos.
-# Rebalanceamento: onde morre uma, nasce oposta 1 Passo para la do fecho, com ref propria.
-# Trava: ativa a 60% do caminho ref->preco. Recuo 10% antes do alvo fecha. Depois do alvo, recuo 15% tranca.
-# Lucro ao infinito: depois do alvo nao fecha obrigatoriamente, continua enquanto preco for nessa direcao.
-# Varias ordens juntas. Opostas nascem atras. Ultima ordem: fecha 5 distantes, abre a frente.
-# Saldo: verde se >=0, vermelho so se <0. Saldo Total = Saldo Operacao. Saldo Op = Inicial +/- PnL.
+# ND-SCALPING V6 - GRID FINITO - ORDENS FINITAS
+# Visual antigo exato.
+# REGRA DURA: Total de ordens NUNCA passa do programado (N Total Ordens, ex 10).
+# 1 fecha com lucro = 1 nasce. Mesma margem, mesmo passo. Nunca 2 por fecho.
+# Ultima ordem: troca, nao soma. Fecha X distantes, abre X a frente. Total sempre 10.
+# Folga: Saldo Livre = Saldo Operacao - Em uso. So ativa se Livre >= Margem. Com lucro, folga cresce.
+# Grid 5 LONG + 5 SHORT. Cada ordem ref + preco. Respiro 1 Passo. Rebalanceamento: nasce oposta 1 Passo para la do fecho.
+# Trava 60%. Recuo 10% antes do alvo, 15% depois do alvo. Lucro ao infinito.
+# Saldo: verde se >=0, vermelho so se <0. Saldo Total = Saldo Operacao. Saldo Op = Inicial +/- PnL total (todas as ordens, nao so ultimas 200).
 # Cofre Global = Saldo Anterior + PnL da operacao atual. Ref quando parado = Preco atual. Hora Luanda +1.
 # Preco REAL Bybit, sem random. Congela se falhar, mostra Cache.
 import os, json, time, threading, urllib.request
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template_string
 app = Flask(__name__)
-DATA_FILE = "/tmp/nd_v6_grid.json"
+DATA_FILE = "/tmp/nd_v6_finito.json"
 def now():
     return (datetime.utcnow() + timedelta(hours=1)).strftime("%H:%M:%S")
 def load():
@@ -25,7 +25,7 @@ def save(s):
         with open(DATA_FILE,"w") as f: json.dump(s,f)
     except: pass
 def default_state():
-    return {"running":False,"price":0.0,"ref":0.0,"saldo_total":25.0,"saldo_op":25.0,"saldo_op_inicio":25.0,"em_uso":0.0,"cofre_ciclo":25.0,"cofre_global":25.0,"cofre_orfa":0.0,"orders":[],"history":[],"settings":{"saldo_op":25.0,"margem":10.0,"alav":15,"passo":25,"total_ordens":10,"lucro_op":5,"modo":"Manual","ops_dia":10},"last_update":"--","fonte":"Bybit - a ligar...","terreno":"LIMPO","trajetoria":"a descer","pausa_orfa":0}
+    return {"running":False,"price":0.0,"ref":0.0,"saldo_total":25.0,"saldo_op":25.0,"saldo_op_inicio":25.0,"em_uso":0.0,"cofre_ciclo":25.0,"cofre_global":25.0,"cofre_orfa":0.0,"pnl_acumulado":0.0,"orders":[],"history":[],"settings":{"saldo_op":25.0,"margem":10.0,"alav":15,"passo":25,"total_ordens":10,"lucro_op":5,"modo":"Manual","ops_dia":10},"last_update":"--","fonte":"Bybit - a ligar...","terreno":"LIMPO","trajetoria":"a descer","pausa_orfa":0}
 state = load() or default_state()
 LAST_REAL = [state.get("price") or 0.0]
 def fetch_bybit_price():
@@ -46,23 +46,33 @@ def mk_order(lado, ref, preco, origem):
 def build_grid(price, passo):
     orders=[]
     for i in range(5):
-        # LONG: ref a (i+1)*Passo acima do preco inicial, preco a +Passo da ref. Respiro 1 Passo.
         refL = price + (i+1)*passo
         orders.append({"id":f"L{i+1}","lado":"LONG","tipo":"PENDING","ref":round(refL,1),"entrada":round(refL,1),"alvo":round(refL+passo,1),"pnl":0.0,"falta":100.0,"trava":"","flutuante":True,"origem":"GRID","best":None,"armado":False,"armado_em":None,"passou_alvo":False})
-        # SHORT: ref a (i+1)*Passo abaixo, preco a -Passo da ref.
         refS = price - (i+1)*passo
         orders.append({"id":f"S{i+1}","lado":"SHORT","tipo":"PENDING","entrada":round(refS,1),"ref":round(refS,1),"alvo":round(refS-passo,1),"pnl":0.0,"falta":100.0,"trava":"","flutuante":True,"origem":"GRID","best":None,"armado":False,"armado_em":None,"passou_alvo":False})
     return orders
+def total_max():
+    return int(state["settings"].get("total_ordens") or 10)
+def add_order_keep_cap(new_o):
+    # Adiciona so se total < teto. Se total ja no teto, remove a PENDING mais distante primeiro (troca, nao soma).
+    if len(state["orders"]) >= total_max():
+        pend = [x for x in state["orders"] if x["tipo"]=="PENDING"]
+        if pend:
+            # Remove a mais distante do preco atual
+            far = max(pend, key=lambda x: abs(x["ref"] - state["price"]))
+            state["orders"].remove(far)
+        else:
+            return False
+    state["orders"].append(new_o)
+    return True
 def close_order(o, exit_price, motivo):
     passo = state["settings"]["passo"] or 25
-    # PnL = distancia percorrida desde ref, proporcional. Se foi alem do alvo, lucro maior (infinito).
     mov = (exit_price - o["ref"]) if o["lado"]=="LONG" else (o["ref"] - exit_price)
-    # Lucro base: 1 Passo = lucro_op * 0.012, proporcional ao movimento
     pnl = round((mov / passo) * state["settings"]["lucro_op"] * 0.012, 4) if passo else 0.0
-    # Se fechou antes da ref (nunca deve acontecer com trava), zera
-    if mov < 0: pnl = -abs(pnl) if False else round(mov * 0.001, 4)
+    if mov < 0: pnl = round(mov * 0.001, 4)
     anterior = state["saldo_op"]
-    state["saldo_op"]=round(state["saldo_op"]+pnl,4)
+    state["pnl_acumulado"]=round(state.get("pnl_acumulado",0)+pnl,4)
+    state["saldo_op"]=round(state["saldo_op_inicio"] + state["pnl_acumulado"],4)
     state["saldo_total"]=state["saldo_op"]
     state["cofre_global"]=round(anterior + pnl,4)
     state["cofre_ciclo"]=round(state["cofre_ciclo"]+pnl,4)
@@ -70,7 +80,6 @@ def close_order(o, exit_price, motivo):
     state["history"]=state["history"][:200]
     return pnl
 def born_opposite(close_price, lado_fechado, passo):
-    # Onde morre uma, nasce oposta 1 Passo para la do fecho, com ref propria. Nunca nasce ativa.
     if lado_fechado=="LONG":
         ref = round(close_price - passo,1)
         return mk_order("SHORT", ref, ref-passo, "REBALANCEAMENTO")
@@ -87,20 +96,27 @@ def bot_loop():
                     state["ref"]=p
             if state["running"] and state["price"]>0:
                 price=state["price"]; passo=state["settings"]["passo"] or 25; orders=state["orders"]
-                # DEDUPLICA: nunca mesmo lado + mesma ref + mesmo tipo
+                # DEDUPLICA + TETO: nunca passa do programado
                 seen=set(); uniq=[]
                 for o in orders:
                     k=(o["lado"],o["ref"],o["tipo"])
                     if k in seen: continue
                     seen.add(k); uniq.append(o)
-                state["orders"]=uniq; orders=uniq
-                # ATIVACAO - so no toque da ref. PENDING nunca mexe, fica a respirar.
+                state["orders"]=uniq[:total_max()]; orders=state["orders"]
+                # FOLGA: Saldo Livre = Saldo - Em uso. So ativa se Livre >= Margem.
+                def saldo_livre():
+                    em_uso = len([x for x in state["orders"] if x["tipo"]=="ACTIVE"])*state["settings"]["margem"]
+                    return state["saldo_op"] - em_uso
+                # ATIVACAO - so no toque da ref, e so se houver folga. PENDING nao mexe.
                 for o in list(orders):
                     if o["tipo"]=="PENDING":
-                        if o["lado"]=="LONG" and price>=o["ref"]:
-                            o["tipo"]="ACTIVE"; o["best"]=price; o["armado"]=False; o["armado_em"]=None
-                        elif o["lado"]=="SHORT" and price<=o["ref"]:
-                            o["tipo"]="ACTIVE"; o["best"]=price; o["armado"]=False; o["armado_em"]=None
+                        toca = (o["lado"]=="LONG" and price>=o["ref"]) or (o["lado"]=="SHORT" and price<=o["ref"])
+                        if toca:
+                            if saldo_livre() >= state["settings"]["margem"]:
+                                o["tipo"]="ACTIVE"; o["best"]=price; o["armado"]=False; o["armado_em"]=None
+                            else:
+                                # Sem folga: fica PENDING a espera, nao ativa alem do saldo
+                                pass
                         else:
                             o["pnl"]=0.0; o["falta"]=100.0; o["trava"]=""
                 # MONITOR ACTIVE - TRAVA 60% + RECUO 10% / 15% + INFINITO
@@ -117,63 +133,60 @@ def bot_loop():
                                 else: o["best"]=min(o["best"],price)
                             passou = (price>=o["alvo"]) if o["lado"]=="LONG" else (price<=o["alvo"])
                             if passou: o["passou_alvo"]=True
-                            # TRAVA ativa a 60%
                             if prog>=0.6 and not o.get("armado"):
                                 o["armado"]=True; o["armado_em"]=price; o["trava"]="TRAVA ARMADA 60%"
                             elif o.get("armado"): o["trava"]="TRAVA ARMADA 60%"
-                            # FECHO POR RECUO: antes do alvo 10%, depois do alvo 15%
                             if o.get("armado") and o.get("best") is not None:
                                 recuo = abs(price - o["best"])
                                 limite = 0.15*passo if o.get("passou_alvo") else 0.10*passo
                                 if recuo >= limite:
                                     motivo = "Trava 15% pos-alvo" if o.get("passou_alvo") else "Trava 10%"
                                     close_order(o,price,motivo); orders.remove(o)
-                                    # REBALANCEAMENTO: nasce oposta 1 Passo para la do fecho
-                                    orders.append(born_opposite(price, o["lado"], passo))
-                                    # Mantem grid cheio: nasce seguinte mesma direcao a frente
-                                    if o["lado"]=="LONG":
-                                        ref2 = round(price + 2*passo,1)
-                                        orders.append(mk_order("LONG", ref2, ref2+passo, "GRID-FRENTE"))
-                                    else:
-                                        ref2 = round(price - 2*passo,1)
-                                        orders.append(mk_order("SHORT", ref2, ref2-passo, "GRID-FRENTE"))
+                                    # 1 FECHA = 1 NASCE. Mesma margem, mesmo passo. Nunca 2.
+                                    add_order_keep_cap(born_opposite(price, o["lado"], passo))
                                     break
                         else:
-                            # Voltou abaixo da ref sem ter armado trava: volta a PENDING? Nao, mantem ACTIVE mas sem lucro.
-                            # Se recuar muito (mais de 1 Passo abaixo da ref), fecha por protecao e reequilibra
                             if mov < -passo:
                                 close_order(o,price,"Protecao -1 Passo"); orders.remove(o)
-                                orders.append(born_opposite(price, o["lado"], passo))
+                                add_order_keep_cap(born_opposite(price, o["lado"], passo))
                                 break
-                # ULTIMA ORDEM: chegou a ultima, fecha 5 distantes, abre a frente
+                # ULTIMA ORDEM: troca, nao soma. Fecha X distantes, abre X a frente. Total sempre = teto.
                 if orders:
                     longs = [x for x in orders if x["lado"]=="LONG"]
                     shorts = [x for x in orders if x["lado"]=="SHORT"]
                     if longs:
                         ultima_long = max(longs, key=lambda x: x["ref"])
                         if price >= ultima_long["ref"]:
-                            # Fecha 5 SHORTs mais distantes (mais abaixo)
                             dist = sorted([x for x in shorts if x["tipo"]=="PENDING"], key=lambda x: x["ref"])
-                            for d in dist[:5]:
+                            # Fecha 5 distantes e abre 5 a frente = troca 5 por 5, total igual
+                            n = min(5, len(dist))
+                            for d in dist[:n]:
                                 if d in orders: orders.remove(d)
-                            # Abre a frente na direcao
                             base = ultima_long["ref"]
-                            for k in range(1,4):
+                            for k in range(1, n+1):
                                 ref2 = round(base + k*passo,1)
                                 if not any(x["lado"]=="LONG" and x["ref"]==ref2 for x in orders):
-                                    orders.append(mk_order("LONG", ref2, ref2+passo, "FRENTE-ULTIMA"))
+                                    # So adiciona se houver espaco (total < teto) ou ja removemos os 5, logo ha espaco
+                                    if len(orders) < total_max():
+                                        orders.append(mk_order("LONG", ref2, ref2+passo, "FRENTE-ULTIMA"))
                     if shorts:
                         ultima_short = min(shorts, key=lambda x: x["ref"])
                         if price <= ultima_short["ref"]:
                             dist = sorted([x for x in longs if x["tipo"]=="PENDING"], key=lambda x: x["ref"], reverse=True)
-                            for d in dist[:5]:
+                            n = min(5, len(dist))
+                            for d in dist[:n]:
                                 if d in orders: orders.remove(d)
                             base = ultima_short["ref"]
-                            for k in range(1,4):
+                            for k in range(1, n+1):
                                 ref2 = round(base - k*passo,1)
                                 if not any(x["lado"]=="SHORT" and x["ref"]==ref2 for x in orders):
-                                    orders.append(mk_order("SHORT", ref2, ref2-passo, "FRENTE-ULTIMA"))
-                # Saldo Total = Saldo Operacao. Em uso = ACTIVE * margem
+                                    if len(orders) < total_max():
+                                        orders.append(mk_order("SHORT", ref2, ref2-passo, "FRENTE-ULTIMA"))
+                # Se por algum motivo passou do teto, corta as PENDING mais distantes
+                if len(state["orders"]) > total_max():
+                    pend = sorted([x for x in state["orders"] if x["tipo"]=="PENDING"], key=lambda x: abs(x["ref"]-price), reverse=True)
+                    for extra in pend[:len(state["orders"])-total_max()]:
+                        state["orders"].remove(extra)
                 state["em_uso"]=round(len([x for x in state["orders"] if x["tipo"]=="ACTIVE"])*state["settings"]["margem"],2)
                 save(state)
         except Exception as e: print("loop",e)
@@ -185,9 +198,9 @@ HTML='''
 </style></head><body>
 <div class="top"><b>ND-SCALPING</b> <span class="papel">PAPEL</span><div class="small">Atualizado: <span id="upd">--</span> | Fonte: <span id="fonte">--</span> | Sem chaves - virtual</div></div>
 <div id="tab-dash">
-<div class="card"><b>STATUS - ANALISE BYBIT</b><div id="status"></div><div style="display:flex;gap:10px;margin-top:10px"><div><div class="small">SALDO TOTAL DA CONTA</div><div class="big" id="saldoTotal">--</div></div><div><div class="small">SALDO EM OPERACAO</div><div class="big" id="saldoOp">--</div></div></div><div class="small">Saldo = Inicial +/- PnL | Inicio: <span id="saldoInicio"></span> | P&L total: <span id="pnlTotal"></span> | Cofre Global: <span id="cofreG"></span></div></div>
+<div class="card"><b>STATUS - ANALISE BYBIT</b><div id="status"></div><div style="display:flex;gap:10px;margin-top:10px"><div><div class="small">SALDO TOTAL DA CONTA</div><div class="big" id="saldoTotal">--</div></div><div><div class="small">SALDO EM OPERACAO</div><div class="big" id="saldoOp">--</div></div></div><div class="small">Saldo = Inicial +/- PnL total | Inicio: <span id="saldoInicio"></span> | P&L total: <span id="pnlTotal"></span> | Cofre Global: <span id="cofreG"></span> | Livre: <span id="saldoLivre"></span></div></div>
 <div class="card"><b>POSICAO ATUAL - AO VIVO</b><div id="pos"></div><button id="mainBtn" class="btn btn-start" onclick="toggle()">INICIAR BOT</button></div>
-<div class="card"><b>GRID — REF NO CENTRO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">Grid 5 LONG + 5 SHORT. Trava 60%. Recuo 10% antes do alvo, 15% depois do alvo. Lucro ao infinito.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
+<div class="card"><b>GRID — REF NO CENTRO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">Grid finito: total = N programado. 1 fecha = 1 nasce. Trava 60%. Recuo 10% antes, 15% depois. Infinito.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
 </div>
 <div id="tab-merc" class="hidden"><div class="card"><b>MERCADO - GRAFICO BYBIT</b><div id="merc"></div><div style="height:120px;background:#0a2a4a;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#7fb3ff">Preço Bybit • Ref • Grid LONG • Grid SHORT</div><div class="small">Trajetoria Bybit: <span id="traj"></span> | Terreno: LIMPO</div><div><b>ORDENS ABERTAS - CONTAGEM</b><div id="contagem"></div></div></div></div>
 <div id="tab-hist" class="hidden"><div class="card"><b>HISTORICO - POR DATA</b><div><label>ESCOLHE O DIA</label><input class="inp" type="date" id="dia"></div><div id="histResumo"></div><div id="hist"></div></div></div>
@@ -205,7 +218,7 @@ HTML='''
 <script>
 let S={};
 function tab(n,el){['dash','merc','hist','aj'].forEach(x=>document.getElementById('tab-'+x).classList.toggle('hidden',x!==n));document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));el.classList.add('on')}
-async function load(){let r=await fetch('/api/state');S=await r.json();document.getElementById('upd').textContent=S.last_update;document.getElementById('fonte').textContent=S.fonte;let corTotal=S.saldo_total>=0?'green':'red';let corOp=S.saldo_op>=0?'green':'red';let st=document.getElementById('saldoTotal');st.textContent=S.saldo_total.toFixed(4);st.className='big '+corTotal;let so=document.getElementById('saldoOp');so.textContent=S.saldo_op.toFixed(4);so.className='big '+corOp;document.getElementById('saldoInicio').textContent=S.saldo_op_inicio;document.getElementById('cofreG').textContent=S.cofre_global.toFixed(4);let pnlTot=S.saldo_op - S.saldo_op_inicio;let pt=document.getElementById('pnlTotal');pt.textContent=(pnlTot>=0?'+':'')+pnlTot.toFixed(4)+' USDT';pt.className=pnlTot>=0?'green':'red';document.getElementById('status').innerHTML=`<div class="${S.running?'green':'red'}">${S.running?'A OPERAR':'PARADO'}</div><div class="small">Par: BTC/USDT:USDT | Preco Bybit: ${S.price} | Ref: ${S.ref} | Modo: PAPEL</div><div style="background:#12331f;padding:6px;border-radius:6px;margin-top:6px">GRID - Preco ${S.price} perto da media ${S.ref}.</div>`;document.getElementById('pos').innerHTML=`<div>Preco Bybit: ${S.price} | Ref: ${S.ref} | Entrada escolhida pelo robo: ${S.ref}</div><div class="big ${pnlTot>=0?'green':'red'}">${pnlTot>=0?'+':''}${pnlTot.toFixed(4)} USDT — P&L total (Saldo - Inicio)</div><div class="small">P&L vivo ACTIVE: ${S.pnl.toFixed(4)} | Cofre ciclo: ${S.cofre_ciclo} | Cofre global: ${S.cofre_global}</div><div>Saldo da operacao: ${S.saldo_op} USDT | Em uso: ${S.em_uso} / ${S.saldo_op} USDT</div>`;document.getElementById('refbar').textContent=`Ref: ${S.ref} • Preço: ${S.price}`;document.getElementById('merc').innerHTML=`Preco Bybit: ${S.price} | Ref: ${S.ref} | Moeda: BTC`;document.getElementById('traj').textContent=S.trajetoria;document.getElementById('contagem').textContent=`${S.orders.length} ordens | ${S.orders.filter(o=>o.tipo==='ACTIVE').length} ACTIVE | ${S.orders.filter(o=>o.tipo==='PENDING').length} PENDING`;let sh=S.orders.filter(o=>o.lado==='SHORT').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)}<br>Falta ${o.falta}% para o alvo ${o.passou_alvo?'• PASSOU ALVO - INFINITO':''}</div>`).join('')||'—';let lo=S.orders.filter(o=>o.lado==='LONG').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)}<br>Falta ${o.falta}% para o alvo ${o.passou_alvo?'• PASSOU ALVO - INFINITO':''}</div>`).join('')||'—';document.getElementById('shorts').innerHTML=sh;document.getElementById('longs').innerHTML=lo;let btn=document.getElementById('mainBtn');btn.textContent=S.running?'PARAR ROBÔ':'INICIAR BOT';btn.className='btn '+(S.running?'btn-stop':'btn-start');let h=S.history;let tot=h.reduce((a,b)=>a+b.pnl,0);document.getElementById('histResumo').innerHTML=`<div class="big ${tot>=0?'green':'red'}">${tot>=0?'+':''}${tot.toFixed(4)} USDT</div><div class="small">LONG: ${h.filter(x=>x.lado==='LONG').reduce((a,b)=>a+b.pnl,0).toFixed(4)} | ${h.filter(x=>x.lado==='LONG').length} ordens | SHORT: ${h.filter(x=>x.lado==='SHORT').reduce((a,b)=>a+b.pnl,0).toFixed(4)} | ${h.filter(x=>x.lado==='SHORT').length} ordens</div>`;document.getElementById('hist').innerHTML=h.map(x=>`<div class="histline">${x.lado} GRID | ${x.hora} | ${x.pnl>=0?'+':''}${x.pnl} USDT<br>${x.entrada} → ${x.saida} • ${x.motivo}</div>`).join('');if(!document.getElementById('f_saldo_op').value){document.getElementById('f_saldo_op').value=S.settings.saldo_op;document.getElementById('f_margem').value=S.settings.margem;document.getElementById('f_alav').value=S.settings.alav;document.getElementById('f_passo').value=S.settings.passo;document.getElementById('f_total').value=S.settings.total_ordens;document.getElementById('f_lucro').value=S.settings.lucro_op;document.getElementById('f_modo').value=S.settings.modo;document.getElementById('f_ops').value=S.settings.ops_dia;}}
+async function load(){let r=await fetch('/api/state');S=await r.json();document.getElementById('upd').textContent=S.last_update;document.getElementById('fonte').textContent=S.fonte;let corTotal=S.saldo_total>=0?'green':'red';let corOp=S.saldo_op>=0?'green':'red';let st=document.getElementById('saldoTotal');st.textContent=S.saldo_total.toFixed(4);st.className='big '+corTotal;let so=document.getElementById('saldoOp');so.textContent=S.saldo_op.toFixed(4);so.className='big '+corOp;document.getElementById('saldoInicio').textContent=S.saldo_op_inicio;document.getElementById('cofreG').textContent=S.cofre_global.toFixed(4);let livre=S.saldo_op - S.em_uso;document.getElementById('saldoLivre').textContent=livre.toFixed(4);let pnlTot=S.saldo_op - S.saldo_op_inicio;let pt=document.getElementById('pnlTotal');pt.textContent=(pnlTot>=0?'+':'')+pnlTot.toFixed(4)+' USDT';pt.className=pnlTot>=0?'green':'red';document.getElementById('status').innerHTML=`<div class="${S.running?'green':'red'}">${S.running?'A OPERAR':'PARADO'}</div><div class="small">Par: BTC/USDT:USDT | Preco Bybit: ${S.price} | Ref: ${S.ref} | Modo: PAPEL</div><div style="background:#12331f;padding:6px;border-radius:6px;margin-top:6px">GRID FINITO - Total ${S.orders.length} / ${S.settings.total_ordens} | Preco ${S.price} perto da media ${S.ref}.</div>`;document.getElementById('pos').innerHTML=`<div>Preco Bybit: ${S.price} | Ref: ${S.ref} | Entrada escolhida pelo robo: ${S.ref}</div><div class="big ${pnlTot>=0?'green':'red'}">${pnlTot>=0?'+':''}${pnlTot.toFixed(4)} USDT — P&L total (Saldo - Inicio)</div><div class="small">P&L vivo ACTIVE: ${S.pnl.toFixed(4)} | Cofre ciclo: ${S.cofre_ciclo} | Cofre global: ${S.cofre_global} | PnL acumulado (todas): ${S.pnl_acumulado}</div><div>Saldo da operacao: ${S.saldo_op} USDT | Em uso: ${S.em_uso} / ${S.saldo_op} USDT | Livre: ${livre.toFixed(4)} USDT</div>`;document.getElementById('refbar').textContent=`Ref: ${S.ref} • Preço: ${S.price}`;document.getElementById('merc').innerHTML=`Preco Bybit: ${S.price} | Ref: ${S.ref} | Moeda: BTC`;document.getElementById('traj').textContent=S.trajetoria;document.getElementById('contagem').textContent=`${S.orders.length} / ${S.settings.total_ordens} ordens | ${S.orders.filter(o=>o.tipo==='ACTIVE').length} ACTIVE | ${S.orders.filter(o=>o.tipo==='PENDING').length} PENDING`;let sh=S.orders.filter(o=>o.lado==='SHORT').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)}<br>Falta ${o.falta}% para o alvo ${o.passou_alvo?'• PASSOU ALVO - INFINITO':''}</div>`).join('')||'—';let lo=S.orders.filter(o=>o.lado==='LONG').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)}<br>Falta ${o.falta}% para o alvo ${o.passou_alvo?'• PASSOU ALVO - INFINITO':''}</div>`).join('')||'—';document.getElementById('shorts').innerHTML=sh;document.getElementById('longs').innerHTML=lo;let btn=document.getElementById('mainBtn');btn.textContent=S.running?'PARAR ROBÔ':'INICIAR BOT';btn.className='btn '+(S.running?'btn-stop':'btn-start');let h=S.history;let tot=S.pnl_acumulado;document.getElementById('histResumo').innerHTML=`<div class="big ${tot>=0?'green':'red'}">${tot>=0?'+':''}${tot.toFixed(4)} USDT — total todas as ordens</div><div class="small">Mostra ultimas 200, total = todas | LONG: ${h.filter(x=>x.lado==='LONG').reduce((a,b)=>a+b.pnl,0).toFixed(4)} | SHORT: ${h.filter(x=>x.lado==='SHORT').reduce((a,b)=>a+b.pnl,0).toFixed(4)}</div>`;document.getElementById('hist').innerHTML=h.map(x=>`<div class="histline">${x.lado} GRID | ${x.hora} | ${x.pnl>=0?'+':''}${x.pnl} USDT<br>${x.entrada} → ${x.saida} • ${x.motivo}</div>`).join('');if(!document.getElementById('f_saldo_op').value){document.getElementById('f_saldo_op').value=S.settings.saldo_op;document.getElementById('f_margem').value=S.settings.margem;document.getElementById('f_alav').value=S.settings.alav;document.getElementById('f_passo').value=S.settings.passo;document.getElementById('f_total').value=S.settings.total_ordens;document.getElementById('f_lucro').value=S.settings.lucro_op;document.getElementById('f_modo').value=S.settings.modo;document.getElementById('f_ops').value=S.settings.ops_dia;}}
 async function toggle(){await fetch('/api/toggle',{method:'POST'});load()}
 async function salvar(){let b={saldo_op:parseFloat(document.getElementById('f_saldo_op').value),margem:parseFloat(document.getElementById('f_margem').value),alav:parseFloat(document.getElementById('f_alav').value),passo:parseFloat(document.getElementById('f_passo').value),total_ordens:parseFloat(document.getElementById('f_total').value),lucro_op:parseFloat(document.getElementById('f_lucro').value),modo:document.getElementById('f_modo').value,ops_dia:parseFloat(document.getElementById('f_ops').value)};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert('Guardado');load()}
 setInterval(load,1500);load();
@@ -222,7 +235,7 @@ def toggle():
     if state["running"]:
         p=fetch_bybit_price()
         if p>0: state["price"]=p
-        state["ref"]=state["price"]; state["saldo_op_inicio"]=state["settings"]["saldo_op"]; state["saldo_op"]=state["settings"]["saldo_op"]; state["saldo_total"]=state["saldo_op"]; state["cofre_global"]=state["saldo_op"]; state["cofre_ciclo"]=state["saldo_op"]
+        state["ref"]=state["price"]; state["saldo_op_inicio"]=state["settings"]["saldo_op"]; state["saldo_op"]=state["settings"]["saldo_op"]; state["saldo_total"]=state["saldo_op"]; state["cofre_global"]=state["saldo_op"]; state["cofre_ciclo"]=state["saldo_op"]; state["pnl_acumulado"]=0.0
         state["orders"]=build_grid(state["ref"], state["settings"]["passo"]); state["history"]=[]
     else:
         state["orders"]=[]; state["ref"]=state["price"]
@@ -230,7 +243,6 @@ def toggle():
 @app.route("/api/settings",methods=["POST"])
 def settings():
     d=request.get_json(force=True); state["settings"].update(d)
-    # Saldo muda -> Inicio muda junto, Saldo Total = Saldo Operacao, Cofre = Saldo
     state["saldo_op"]=d.get("saldo_op",state["saldo_op"]); state["saldo_op_inicio"]=state["saldo_op"]; state["saldo_total"]=state["saldo_op"]; state["cofre_global"]=state["saldo_op"]; state["cofre_ciclo"]=state["saldo_op"]
     save(state); return jsonify({"ok":True})
 if __name__=="__main__":
