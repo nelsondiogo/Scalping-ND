@@ -1,18 +1,15 @@
-# ND-SCALPING V6 - INSTITUCIONAL COMPLETO - FALTA CORRIGIDO + OKX + BITGET TESTE E REAL
-# CORRECAO FALTA: Antes ACTIVE negativa mostrava Falta 1836% porque fazia 100*(1-prog) com prog negativo.
-# Agora: se ACTIVE negativa, Falta = distancia para voltar a 0 em % do passo. Se positiva, Falta = % para o alvo. Nunca mais 1800%.
-# CORRETORA: Bybit / Binance / OKX / Bitget - Adaptador Exchange. CONTA: PAPEL / TESTE / REAL. MOEDA: BTC / ETH / SOL / XRP / DOGE.
-# OKX: TESTE usa x-simulated-trading:1 + chaves Demo. REAL usa x-simulated-trading:0 + chaves Reais. Assinatura OKX: timestamp ISO + method + path + body, base64 HMAC.
-# BITGET: TESTE e REAL com chaves Demo / Reais + passphrase. Assinatura Bitget: timestamp ms + method + path + query + body, base64 HMAC.
-# BYBIT: assinatura v5 correta. BINANCE: HMAC testnet.binance.vision para TESTE, api.binance.com para REAL.
-# CHAVES NUNCA NO CODIGO. No Render: BYBIT_API_KEY/SECRET, BINANCE_API_KEY/SECRET, OKX_API_KEY/SECRET/PASSPHRASE, BITGET_API_KEY/SECRET/PASSPHRASE
-# Para OKX e Bitget, as chaves Demo e Reais sao diferentes - cria uma de cada. PAPEL nao usa chaves. TESTE/REAL so le saldo, nao abre ordens reais nesta versao.
-# VISUAL ANTIGO. GRID FINITO 1 fecha=1 nasce. TRAVA 60%, recuo 10% antes / 15% depois, infinito. SEM PROTECAO. Negativa nunca fecha por estar negativa.
+# ND-SCALPING V6 - OKX CORRIGIDO - CORRETORA A CLICAR + OKX TESTE E REAL
+# CORRECAO 1: Antes OKX voltava para Bybit porque .capitalize() transformava OKX em Okx e nao estava na lista. Agora mapa por minusculas: okx->OKX, bybit->Bybit, binance->Binance, bitget->Bitget. Nunca mais volta para Bybit.
+# CORRECAO 2: Corretora, Conta, Moeda, Modo agora sao LISTA A CLICAR <select>, nao campo para escrever. Defeitos: Bybit / PAPEL / BTC / Manual. Nao da para escrever errado nem deixar vazio.
+# CORRECAO 3: Falta negativa mostra distancia para 0, nunca 1836%.
+# OKX: TESTE usa x-simulated-trading:1 + chaves Demo. REAL usa x-simulated-trading:0 + chaves Reais. Assinatura OKX: timestamp ISO + method + path + body, base64 HMAC. Precisa OKX_API_KEY + OKX_API_SECRET + OKX_PASSPHRASE no Render. Quando mudas de TESTE para REAL no bot, troca tambem as 3 chaves no Render para as da conta certa.
+# BITGET: mesma estrutura, chaves Demo para TESTE, Reais para REAL. BYBIT: v5 correta. BINANCE: testnet.binance.vision para TESTE.
+# CHAVES NUNCA NO CODIGO. VISUAL ANTIGO. GRID FINITO 1 fecha=1 nasce. TRAVA 60%, recuo 10% / 15%, infinito. SEM PROTECAO.
 import os, json, time, threading, random, hashlib, hmac, urllib.request, urllib.parse, base64
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string
 app = Flask(__name__)
-DATA_FILE = "/tmp/nd_v6_institucional.json"
+DATA_FILE = "/tmp/nd_v6_okx.json"
 def now(): return (datetime.utcnow() + timedelta(hours=1)).strftime("%H:%M:%S")
 def load():
     try:
@@ -29,6 +26,11 @@ MOEDAS = {
   "XRP": {"par_bybit":"XRPUSDT","par_binance":"XRPUSDT","par_okx":"XRP-USDT","par_bitget":"XRPUSDT","passo_sug":0.02,"dec":4,"min_nocional":5.0},
   "DOGE": {"par_bybit":"DOGEUSDT","par_binance":"DOGEUSDT","par_okx":"DOGE-USDT","par_bitget":"DOGEUSDT","passo_sug":0.003,"dec":5,"min_nocional":5.0},
 }
+# Mapa a prova de maiusculas: qualquer forma de escrever OKX fica OKX
+MAP_CORRETORA = {"bybit":"Bybit","binance":"Binance","okx":"OKX","bitget":"Bitget"}
+MAP_CONTA = {"papel":"PAPEL","teste":"TESTE","real":"REAL"}
+MAP_MOEDA = {"btc":"BTC","eth":"ETH","sol":"SOL","xrp":"XRP","doge":"DOGE"}
+MAP_MODO = {"manual":"Manual","automatico":"Automatico","automático":"Automatico"}
 CORRETORAS = ["Bybit","Binance","OKX","Bitget"]
 CONTAS = ["PAPEL","TESTE","REAL"]
 def default_state():
@@ -38,6 +40,9 @@ for k,v in default_state().items():
     if k not in state: state[k]=v
 for k,v in default_state()["settings"].items():
     if k not in state["settings"]: state["settings"][k]=v
+# Corrige estado antigo que ficou com Okx ou Bybit por erro
+if str(state["settings"].get("corretora","")).lower() in MAP_CORRETORA:
+    state["settings"]["corretora"]=MAP_CORRETORA[str(state["settings"]["corretora"]).lower()]
 LAST_REAL = [state.get("price") or 0.0]
 def moeda_cfg():
     m = state["settings"].get("moeda","BTC")
@@ -67,14 +72,14 @@ def bybit_price(cfg):
     return None, "Bybit - Cache"
 def bybit_balance():
     key=os.environ.get("BYBIT_API_KEY","").strip(); sec=os.environ.get("BYBIT_API_SECRET","").strip()
-    if not key or not sec: return None, "Sem BYBIT_API_KEY no Render - cria chave de Teste para TESTE, chave Real para REAL"
+    if not key or not sec: return None, "Sem BYBIT_API_KEY no Render"
     base = "https://api-testnet.bybit.com" if is_teste() else "https://api.bybit.com"
     try:
         q="accountType=UNIFIED"; ts,recv,sign = bybit_sign(key,sec,q)
         url=f"{base}/v5/account/wallet-balance?{q}"
         req=urllib.request.Request(url, headers={"X-BAPI-API-KEY":key,"X-BAPI-TIMESTAMP":ts,"X-BAPI-RECV-WINDOW":recv,"X-BAPI-SIGN":sign,"X-BAPI-SIGN-TYPE":"2","User-Agent":"Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=4) as r: d=json.loads(r.read().decode())
-        if d.get("retCode")!=0: return None, f"Bybit retCode {d.get('retCode')}: {d.get('retMsg')} | Chave de {'Testnet' if is_teste() else 'Real'}? Permissao Read?"
+        if d.get("retCode")!=0: return None, f"Bybit retCode {d.get('retCode')}: {d.get('retMsg')} | Chave de {'Testnet' if is_teste() else 'Real'}?"
         tot=0.0
         for acc in d.get("result",{}).get("list",[]):
             for c in acc.get("coin",[]):
@@ -95,7 +100,7 @@ def binance_price(cfg):
     return None, "Binance - Cache"
 def binance_balance():
     key=os.environ.get("BINANCE_API_KEY","").strip(); sec=os.environ.get("BINANCE_API_SECRET","").strip()
-    if not key or not sec: return None, "Sem BINANCE_API_KEY no Render - nunca testaste a conta de teste da Binance, cria chave Testnet para TESTE"
+    if not key or not sec: return None, "Sem BINANCE_API_KEY no Render"
     base="https://testnet.binance.vision" if is_teste() else "https://api.binance.com"
     try:
         ts=str(int(time.time()*1000)); q=f"timestamp={ts}&recvWindow=5000"
@@ -105,8 +110,7 @@ def binance_balance():
             if b.get("asset")=="USDT": return round(float(b.get("free") or 0)+float(b.get("locked") or 0),4), None
         return 0.0, None
     except Exception as e: return None, f"Binance: {str(e)[:180]}"
-# --- OKX - TESTE e REAL ---
-# OKX Demo: x-simulated-trading:1. OKX Real: x-simulated-trading:0. Assinatura: timestamp ISO + method + path + body, base64 HMAC SHA256.
+# --- OKX TESTE E REAL ---
 def okx_price(cfg):
     try:
         d=_get(f"https://www.okx.com/api/v5/market/ticker?instId={cfg['par_okx']}")
@@ -115,7 +119,7 @@ def okx_price(cfg):
     except Exception as e: print("okx price",e); return None,"OKX - Cache"
 def okx_balance():
     key=os.environ.get("OKX_API_KEY","").strip(); sec=os.environ.get("OKX_API_SECRET","").strip(); pp=os.environ.get("OKX_PASSPHRASE","").strip()
-    if not key or not sec or not pp: return None, "Sem OKX_API_KEY / OKX_API_SECRET / OKX_PASSPHRASE no Render - cria chave Demo para TESTE, chave Real para REAL"
+    if not key or not sec or not pp: return None, "Sem OKX_API_KEY / OKX_API_SECRET / OKX_PASSPHRASE no Render - poe as chaves da conta certa: Demo para TESTE, Reais para REAL"
     try:
         path="/api/v5/account/balance"; method="GET"; body=""
         ts=datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00","Z")
@@ -123,7 +127,7 @@ def okx_balance():
         sign=base64.b64encode(hmac.new(sec.encode(), msg, hashlib.sha256).digest()).decode()
         headers={"OK-ACCESS-KEY":key,"OK-ACCESS-SIGN":sign,"OK-ACCESS-TIMESTAMP":ts,"OK-ACCESS-PASSPHRASE":pp,"x-simulated-trading":"1" if is_teste() else "0","User-Agent":"Mozilla/5.0"}
         d=_get(f"https://www.okx.com{path}", headers=headers)
-        if d.get("code")!="0": return None, f"OKX code {d.get('code')}: {d.get('msg')} | Chave de {'Demo' if is_teste() else 'Real'}? Passphrase certa? Permissao Read?"
+        if d.get("code")!="0": return None, f"OKX code {d.get('code')}: {d.get('msg')} | Chave de {'Demo' if is_teste() else 'Real'}? Passphrase certa? Permissao Read? Se puseste chave Demo e escolhes REAL, ou vice-versa, da erro."
         tot=0.0
         for acc in d.get("data",[]):
             for c in acc.get("details",[]):
@@ -132,8 +136,7 @@ def okx_balance():
                     except: pass
         return round(tot,4), None
     except Exception as e: return None, f"OKX: {str(e)[:180]}"
-# --- BITGET - TESTE e REAL ---
-# Bitget: timestamp ms + method + path + query + body, base64 HMAC. Demo usa mesmo endpoint, com passphrase da conta Demo.
+# --- BITGET TESTE E REAL ---
 def bitget_price(cfg):
     try:
         d=_get(f"https://api.bitget.com/api/v2/mix/market/ticker?symbol={cfg['par_bitget']}&productType=USDT-FUTURES")
@@ -142,21 +145,20 @@ def bitget_price(cfg):
     except Exception as e: print("bitget price",e); return None,"Bitget - Cache"
 def bitget_balance():
     key=os.environ.get("BITGET_API_KEY","").strip(); sec=os.environ.get("BITGET_API_SECRET","").strip(); pp=os.environ.get("BITGET_PASSPHRASE","").strip()
-    if not key or not sec or not pp: return None, "Sem BITGET_API_KEY / BITGET_API_SECRET / BITGET_PASSPHRASE no Render - cria chave Demo para TESTE, chave Real para REAL"
+    if not key or not sec or not pp: return None, "Sem BITGET_API_KEY / BITGET_API_SECRET / BITGET_PASSPHRASE no Render"
     try:
         ts=str(int(time.time()*1000)); method="GET"; path="/api/v2/account/all-account-balance"; query="accountType=spot"; body=""
         msg=(ts+method+path+"?"+query+body).encode()
         sign=base64.b64encode(hmac.new(sec.encode(), msg, hashlib.sha256).digest()).decode()
         headers={"ACCESS-KEY":key,"ACCESS-SIGN":sign,"ACCESS-TIMESTAMP":ts,"ACCESS-PASSPHRASE":pp,"Content-Type":"application/json","User-Agent":"Mozilla/5.0"}
         d=_get(f"https://api.bitget.com{path}?{query}", headers=headers)
-        if d.get("code")!="00000": return None, f"Bitget code {d.get('code')}: {d.get('msg')} | Chave de {'Demo' if is_teste() else 'Real'}? Passphrase certa? Permissao Read?"
+        if d.get("code")!="00000": return None, f"Bitget code {d.get('code')}: {d.get('msg')} | Chave de {'Demo' if is_teste() else 'Real'}?"
         tot=0.0
         for acc in d.get("data",[]):
             for c in acc.get("assets",[]) if isinstance(acc.get("assets"),list) else []:
                 if c.get("coin")=="USDT":
                     try: tot+=float(c.get("available") or 0)+float(c.get("frozen") or 0)
                     except: pass
-            # Fallback: formato alternativo da Bitget
             if isinstance(acc,dict) and acc.get("coin")=="USDT":
                 try: tot+=float(acc.get("available") or 0)+float(acc.get("frozen") or 0)
                 except: pass
@@ -175,7 +177,7 @@ def fetch_price():
         p, fonte = fn(cfg)
         if p and p>0: LAST_REAL[0]=p; state["fonte"]=fonte; return p
     except Exception as e: print("price adapter",e)
-    state["fonte"]=f"{corr} - Cache (ultimo preco real)"; return LAST_REAL[0] or state.get("price") or 0.0
+    state["fonte"]=f"{corr} - Cache"; return LAST_REAL[0] or state.get("price") or 0.0
 def sync_saldo_real():
     if is_papel():
         state["chaves"]="PAPEL - Sem leitura de chaves"; state["fonte_saldo"]="Ajustes (PAPEL)"; state["erro_bybit"]=""; return False
@@ -283,7 +285,6 @@ def bot_loop():
                     if o["tipo"]=="ACTIVE":
                         mov=(price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-price)
                         prog=mov/passo if passo else 0
-                        # CORRECAO FALTA: negativa mostra distancia para 0, nunca 1800%
                         if prog>=0: o["falta"]=round(100*(1-prog),1) if prog<1 else 0.0
                         else: o["falta"]=round(abs(prog)*100,1)
                         o["pnl"]=round(mov*0.0015,4)
@@ -353,10 +354,10 @@ HTML='''
 </div>
 <div id="tab-merc" class="hidden"><div class="card"><b>MERCADO - GRAFICO</b><div id="merc"></div><div style="position:relative;height:160px;background:#0a2a4a;border-radius:8px;overflow:hidden;margin:8px 0"><div id="priceLine" style="position:absolute;left:0;right:0;height:2px;background:#fff"></div><div id="refLine" style="position:absolute;left:0;right:0;height:2px;background:#f1c40f"></div><div id="ordDots"></div><div id="priceLabel" style="position:absolute;right:6px;background:#fff;color:#000;padding:2px 6px;border-radius:4px;font-size:12px;font-weight:bold"></div></div><div class="small">Linha branca = Preço | Linha amarela = Ref | Verde = LONG | Vermelho = SHORT | Trajetoria: <span id="traj"></span></div><div><b>ORDENS ABERTAS</b><div id="contagem"></div></div></div></div>
 <div id="tab-hist" class="hidden"><div class="card"><b>HISTORICO</b><div><label>ESCOLHE O DIA</label><input class="inp" type="date" id="dia"></div><div id="histResumo"></div><div id="hist"></div></div></div>
-<div id="tab-aj" class="hidden"><div class="card"><b>AJUSTES</b>
-<label>CORRETORA - Bybit / Binance / OKX / Bitget</label><input class="inp" id="f_corretora">
-<label>CONTA - PAPEL / TESTE / REAL</label><input class="inp" id="f_conta_tipo">
-<label>MOEDA - BTC / ETH / SOL / XRP / DOGE</label><input class="inp" id="f_moeda">
+<div id="tab-aj" class="hidden"><div class="card"><b>AJUSTES - CLICA PARA ESCOLHER, NAO E PARA ESCREVER</b>
+<label>CORRETORA - Clica para escolher</label><select class="inp" id="f_corretora"><option value="Bybit">Bybit</option><option value="Binance">Binance</option><option value="OKX">OKX</option><option value="Bitget">Bitget</option></select>
+<label>CONTA - Clica para escolher</label><select class="inp" id="f_conta_tipo"><option value="PAPEL">PAPEL</option><option value="TESTE">TESTE</option><option value="REAL">REAL</option></select>
+<label>MOEDA - Clica para escolher</label><select class="inp" id="f_moeda"><option value="BTC">BTC</option><option value="ETH">ETH</option><option value="SOL">SOL</option><option value="XRP">XRP</option><option value="DOGE">DOGE</option></select>
 <label>SALDO DA CONTA (USDT) - Se TESTE/REAL, le o real e ignora este campo</label><input class="inp" id="f_conta">
 <label>SALDO DA OPERACAO (USDT)</label><input class="inp" id="f_saldo_op">
 <label>MARGEM POR ORDEM</label><input class="inp" id="f_margem">
@@ -364,9 +365,9 @@ HTML='''
 <label>ESPACAMENTO GRID - PASSO - BTC 25, ETH 3, SOL 1, XRP 0.02, DOGE 0.003</label><input class="inp" id="f_passo">
 <label>NUMERO TOTAL DE ORDENS</label><input class="inp" id="f_total">
 <label>LUCRO POR OPERACAO (USDT)</label><input class="inp" id="f_lucro">
-<label>MODO - Manual ou Automatico</label><input class="inp" id="f_modo">
+<label>MODO - Clica para escolher</label><select class="inp" id="f_modo"><option value="Manual">Manual</option><option value="Automatico">Automatico</option></select>
 <label>OPERACOES POR DIA - AUTOMATICO: ALVO = LUCRO X OPERACOES</label><input class="inp" id="f_ops">
-<button class="btn btn-save" onclick="salvar()">GUARDAR</button><div class="small">Os campos so mudam no GUARDAR. PAPEL / TESTE / REAL nao dao o mesmo numero, dao o mesmo comportamento. OKX e Bitget: cria chave Demo para TESTE e chave Real para REAL, com passphrase.</div></div></div>
+<button class="btn btn-save" onclick="salvar()">GUARDAR</button><div class="small">OKX: para TESTE usa chaves Demo no Render. Para REAL usa chaves Reais no Render. Nao mistures: chave Demo com conta REAL da erro, e vice-versa.</div></div></div>
 <div class="tabs"><button onclick="tab('dash',this)" class="on">Dashboard</button><button onclick="tab('merc',this)">Mercado</button><button onclick="tab('hist',this)">Historico</button><button onclick="tab('aj',this)">Ajustes</button></div>
 <script>
 let S={}; let ajPreenchido=false;
@@ -405,12 +406,11 @@ def toggle():
 @app.route("/api/settings",methods=["POST"])
 def settings():
     d=request.get_json(force=True)
-    if d.get("corretora"): d["corretora"]=str(d["corretora"]).strip().capitalize()
-    if d.get("conta"): d["conta"]=str(d["conta"]).strip().upper()
-    if d.get("moeda"): d["moeda"]=str(d["moeda"]).strip().upper()
-    if d.get("corretora") not in CORRETORAS: d["corretora"]="Bybit"
-    if d.get("conta") not in CONTAS: d["conta"]="PAPEL"
-    if d.get("moeda") not in MOEDAS: d["moeda"]="BTC"
+    # Normaliza por minusculas - OKX nunca mais vira Okx
+    if d.get("corretora"): d["corretora"]=MAP_CORRETORA.get(str(d["corretora"]).strip().lower(), "Bybit")
+    if d.get("conta"): d["conta"]=MAP_CONTA.get(str(d["conta"]).strip().lower(), "PAPEL")
+    if d.get("moeda"): d["moeda"]=MAP_MOEDA.get(str(d["moeda"]).strip().lower(), "BTC")
+    if d.get("modo"): d["modo"]=MAP_MODO.get(str(d["modo"]).strip().lower(), "Manual")
     state["settings"].update(d)
     if state.get("saldo_conta_real") is None or is_papel():
         state["saldo_conta"]=d.get("saldo_conta",state["saldo_conta"]); state["saldo_conta_inicio"]=state["saldo_conta"]
