@@ -1,19 +1,22 @@
-# ND-SCALPING V6 - FLUTUANTE AGRESSIVO + CONTROLO NEGATIVAS
-# REGRA NOVA PEDIDA: PENDING nunca fica parado longe do preco. Se preco sobe, PENDING SHORT sobem atras dele, sempre a 1 passo. Se preco desce, PENDING LONG descem atras dele, sempre a 1 passo. So fica fixo quando o preco vem na direcao dele para ativar.
-# AGRESSIVO COMO EM PAPEL: Passo 10, ativacao imediata sem atraso, trava arma 40%, trava fecha com recuo 7%, total ordens 20, grid sempre cheio.
-# CONTROLO NEGATIVAS: Max 3 ACTIVE negativas ao mesmo tempo, max 2 negativas do mesmo lado. Se ja tens 3 negativas, nao abre mais desse lado, so do lado contrario (Resgate). Negativa nunca fecha com prejuizo. Lucro do lado contrario paga a negativa mais antiga primeiro. Negativa acima de -5 USDT entra em resgate forcado. PENDING a mais de 50 do preco e reciclada para perto do preco.
-# VISUAL ANTIGO. OKX Demo/Real. Chaves no Render: OKX_API_KEY + OKX_API_SECRET + OKX_PASSPHRASE.
+# ND-SCALPING V6 - SOLUCAO RESGATE
+# SOLUCAO 1 RESGATE NAO CONTA PERDA 2X: Se Cofre Resgate tem valor para pagar a negativa, fecha a negativa a 0.0000 no Historico. Nao soma -0.188 ao total. Cofre baixa, negativa desaparece, total nao cai. So fecha quando Cofre >= custo completo.
+# SOLUCAO 2 TRAVA NAO FECHA NEGATIVO: Se fecho calculado der negativo, trava nao fecha. Espera. Recuo 20% com passo 15 para fecho ficar acima da taxa. Trava arma 40%.
+# SOLUCAO 3 MAX 2 NEGATIVAS NO TOTAL: Max 1 LONG negativa + 1 SHORT negativa = 2 total. Se ja tem 2, nao abre mais nenhuma ACTIVE. So PENDING a espera.
+# SOLUCAO 4 REF SEGUE PRECO: Ref = preco atual sempre. Nao fica congelada no inicio.
+# SOLUCAO 5 FALTA EM PONTOS: Mostra Falta X pontos para voltar a 0, nao Falta 460%.
+# FLUTUANTE: PENDING segue preco a 1 passo, so congela quando preco vem para ativar. Passo 15, total ordens 20, ativacao imediata.
+# VISUAL ANTIGO. OKX Demo/Real. Chaves Render: OKX_API_KEY + OKX_API_SECRET + OKX_PASSPHRASE.
 import os, json, time, threading, random, hashlib, hmac, urllib.request, urllib.parse, base64, math
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string
 app = Flask(__name__)
-DATA_FILE = "/tmp/nd_v6_flutuante.json"
+DATA_FILE = "/tmp/nd_v6_solucao.json"
 def now(): return (datetime.utcnow() + timedelta(hours=1)).strftime("%H:%M:%S")
 def load(): return json.load(open(DATA_FILE)) if os.path.exists(DATA_FILE) else None
 def save(s): open(DATA_FILE,"w").write(json.dumps(s))
 MOEDAS = {
-  "BTC": {"par_bybit":"BTCUSDT","par_binance":"BTCUSDT","par_okx":"BTC-USDT","par_bitget":"BTCUSDT","inst_okx":"BTC-USDT-SWAP","passo_sug":10,"dec":1,"min_nocional":60.0},
+  "BTC": {"par_bybit":"BTCUSDT","par_binance":"BTCUSDT","par_okx":"BTC-USDT","par_bitget":"BTCUSDT","inst_okx":"BTC-USDT-SWAP","passo_sug":15,"dec":1,"min_nocional":60.0},
   "ETH": {"par_bybit":"ETHUSDT","par_binance":"ETHUSDT","par_okx":"ETH-USDT","par_bitget":"ETHUSDT","inst_okx":"ETH-USDT-SWAP","passo_sug":3,"dec":2,"min_nocional":10.0},
   "SOL": {"par_bybit":"SOLUSDT","par_binance":"SOLUSDT","par_okx":"SOL-USDT","par_bitget":"SOLUSDT","inst_okx":"SOL-USDT-SWAP","passo_sug":1.0,"dec":2,"min_nocional":5.0},
   "XRP": {"par_bybit":"XRPUSDT","par_binance":"XRPUSDT","par_okx":"XRP-USDT","par_bitget":"XRPUSDT","inst_okx":"XRP-USDT-SWAP","passo_sug":0.02,"dec":4,"min_nocional":5.0},
@@ -24,7 +27,7 @@ MAP_CONTA = {"papel":"PAPEL","teste":"TESTE","real":"REAL"}
 MAP_MOEDA = {"btc":"BTC","eth":"ETH","sol":"SOL","xrp":"XRP","doge":"DOGE"}
 MAP_MODO = {"manual":"Manual","automatico":"Automatico","automático":"Automatico"}
 def default_state():
-    return {"running":False,"price":0.0,"ref":0.0,"saldo_conta":100.0,"saldo_conta_inicio":100.0,"saldo_conta_real":None,"saldo_op":25.0,"saldo_op_inicio":25.0,"em_uso":0.0,"reserva":75.0,"cofre_op":0.0,"cofre_global":100.0,"cofre_resgate":0.0,"pnl_acumulado":0.0,"pnl_long":0.0,"pnl_short":0.0,"orders":[],"history":[],"encerramento":False,"alvo_total":0.0,"chaves":"A VERIFICAR","fonte_saldo":"Ajustes (PAPEL)","erro_bybit":"","execucao":"PAPEL - Simulacao","lote_info":"A carregar lote OKX...","settings":{"saldo_conta":100.0,"saldo_op":25.0,"margem":5.0,"alav":15,"passo":10,"total_ordens":20,"lucro_op":5,"modo":"Manual","ops_dia":8,"corretora":"Bybit","conta":"PAPEL","moeda":"BTC"},"last_update":"--","fonte":"A ligar...","trajetoria":"a descer"}
+    return {"running":False,"price":0.0,"ref":0.0,"saldo_conta":100.0,"saldo_conta_inicio":100.0,"saldo_conta_real":None,"saldo_op":25.0,"saldo_op_inicio":25.0,"em_uso":0.0,"reserva":75.0,"cofre_op":0.0,"cofre_global":100.0,"cofre_resgate":0.0,"pnl_acumulado":0.0,"pnl_long":0.0,"pnl_short":0.0,"orders":[],"history":[],"encerramento":False,"alvo_total":0.0,"chaves":"A VERIFICAR","fonte_saldo":"Ajustes (PAPEL)","erro_bybit":"","execucao":"PAPEL - Simulacao","lote_info":"A carregar lote OKX...","settings":{"saldo_conta":100.0,"saldo_op":25.0,"margem":5.0,"alav":15,"passo":15,"total_ordens":20,"lucro_op":5,"modo":"Manual","ops_dia":8,"corretora":"Bybit","conta":"PAPEL","moeda":"BTC"},"last_update":"--","fonte":"A ligar...","trajetoria":"a descer"}
 state = load() or default_state()
 for k,v in default_state().items():
     if k not in state: state[k]=v
@@ -34,10 +37,9 @@ if str(state["settings"].get("corretora","")).lower() in MAP_CORRETORA:
     state["settings"]["corretora"]=MAP_CORRETORA[str(state["settings"]["corretora"]).lower()]
 LAST_REAL = [state.get("price") or 0.0]
 LOTE_CACHE = {}
-# Controlo negativas - constantes fixas
-MAX_NEG_TOTAL = 3
-MAX_NEG_LADO = 2
-LIMITE_NEG_USDT = 5.0
+MAX_NEG_TOTAL = 2
+MAX_NEG_LADO = 1
+LIMITE_NEG_USDT = 0.50
 def moeda_cfg():
     m = state["settings"].get("moeda","BTC")
     return MOEDAS.get(m, MOEDAS["BTC"]), m
@@ -222,9 +224,8 @@ def okx_close_market(lado, sz_str=None):
     return d, None
 def mk_order(lado, ref, passo, origem):
     alvo=round(ref+passo,1) if lado=="LONG" else round(ref-passo,1)
-    return {"id":f"{lado[0]}{int(time.time()*1000)%1000000}{len(state['orders'])}","lado":lado,"tipo":"PENDING","ref":round(ref,1),"entrada":round(ref,1),"alvo":alvo,"pnl":0.0,"falta":100.0,"trava":"","flutuante":True,"congelada":False,"origem":origem,"best":None,"armado":False,"armado_em":None,"passou_alvo":False,"ativar_em":None,"preco_fill":None,"okx_ord_id":None,"sz":None}
+    return {"id":f"{lado[0]}{int(time.time()*1000)%1000000}{len(state['orders'])}","lado":lado,"tipo":"PENDING","ref":round(ref,1),"entrada":round(ref,1),"alvo":alvo,"pnl":0.0,"falta_pts":0.0,"trava":"","flutuante":True,"congelada":False,"origem":origem,"best":None,"armado":False,"armado_em":None,"passou_alvo":False,"ativar_em":None,"preco_fill":None,"okx_ord_id":None,"sz":None}
 def build_grid(price, passo):
-    # Grid inicial ja flutuante: 10 LONG acima, 10 SHORT abaixo, cada um a 1..10 passos - mas o flutuante vai puxar os mais perto para 1 passo
     orders=[]
     for i in range(10):
         refL=price+(i+1)*passo; orders.append(mk_order("LONG",refL,passo,"GRID-FLUT"))
@@ -239,15 +240,10 @@ def count_negativas():
     neg_short=[x for x in neg if x["lado"]=="SHORT"]
     return neg, neg_long, neg_short
 def pode_abrir_lado(lado):
-    # Controlo negativas: max 3 total, max 2 por lado. Se ja no limite, bloqueia esse lado, deixa o contrario trabalhar (resgate)
     neg, neg_long, neg_short = count_negativas()
-    if len(neg)>=MAX_NEG_TOTAL:
-        # Se ja tem 3 negativas, so pode abrir o lado com menos negativas
-        if lado=="LONG" and len(neg_long)>=len(neg_short): return False
-        if lado=="SHORT" and len(neg_short)>=len(neg_long): return False
+    if len(neg)>=MAX_NEG_TOTAL: return False
     if lado=="LONG" and len(neg_long)>=MAX_NEG_LADO: return False
     if lado=="SHORT" and len(neg_short)>=MAX_NEG_LADO: return False
-    # Resgate forcado: se alguma negativa passou -5 USDT, bloqueia o lado dela
     for o in neg:
         if o.get("pnl",0) < -LIMITE_NEG_USDT and o["lado"]==lado: return False
     return True
@@ -259,9 +255,20 @@ def add_order_keep_cap(new_o):
             far=max(pend, key=lambda x: abs(x["ref"]-state["price"])); state["orders"].remove(far)
         else: return False
     state["orders"].append(new_o); return True
-def close_order(o, exit_price, motivo):
-    passo=state["settings"]["passo"] or 10
+def estimar_pnl(o, exit_price):
+    passo=state["settings"]["passo"] or 15
+    mov=(exit_price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-exit_price)
+    valor=min(float(state["settings"].get("margem") or 5.0),5.0); taxa=valor*0.00055*2
     if executar_okx():
+        try: sz_f=float(o.get("sz") or calc_sz_float(exit_price))
+        except: sz_f=calc_sz_float(exit_price)
+        lote=okx_lote(); return round(mov*sz_f*lote["ctVal"]-taxa,4)
+    else:
+        pnl_bruto=round((mov/passo)*float(state["settings"].get("lucro_op") or 5)*0.05,4) if passo else 0.0
+        if mov<0: pnl_bruto=round(mov*0.0015,4)
+        return round(pnl_bruto-taxa,4)
+def close_order(o, exit_price, motivo, pnl_forcado=None):
+    if executar_okx() and pnl_forcado is None:
         d, err = okx_close_market(o["lado"], o.get("sz"))
         if err:
             state["erro_bybit"]=f"Falha a fechar na OKX ({o['lado']}): {err} - fica ACTIVE, nao contada."
@@ -269,20 +276,11 @@ def close_order(o, exit_price, motivo):
         try: exit_price=float(d["data"][0].get("fillPx") or exit_price)
         except: pass
     else:
-        slip=random.uniform(0.5,1)
-        if o["lado"]=="LONG": exit_price=round(exit_price-slip,1)
-        else: exit_price=round(exit_price+slip,1)
-    mov=(exit_price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-exit_price)
-    valor=min(float(state["settings"].get("margem") or 5.0),5.0); taxa=valor*0.00055*2
-    if executar_okx():
-        try: sz_f=float(o.get("sz") or calc_sz_float(exit_price))
-        except: sz_f=calc_sz_float(exit_price)
-        lote=okx_lote(); pnl_bruto=round(mov*sz_f*lote["ctVal"],4); pnl=round(pnl_bruto-taxa,4)
-    else:
-        # PAPEL agressivo: lucro proporcional ao movimento com passo 10
-        pnl_bruto=round((mov/passo)*float(state["settings"].get("lucro_op") or 5)*0.05,4) if passo else 0.0
-        if mov<0: pnl_bruto=round(mov*0.0015,4)
-        pnl=round(pnl_bruto-taxa,4)
+        if pnl_forcado is None:
+            slip=random.uniform(0.5,1)
+            if o["lado"]=="LONG": exit_price=round(exit_price-slip,1)
+            else: exit_price=round(exit_price+slip,1)
+    pnl = pnl_forcado if pnl_forcado is not None else estimar_pnl(o, exit_price)
     state["pnl_acumulado"]=round(state.get("pnl_acumulado",0)+pnl,4)
     if pnl>0: state["cofre_resgate"]=round(state.get("cofre_resgate",0)+pnl,4)
     if o["lado"]=="LONG": state["pnl_long"]=round(state.get("pnl_long",0)+pnl,4)
@@ -290,32 +288,45 @@ def close_order(o, exit_price, motivo):
     state["saldo_op"]=round(state["saldo_op_inicio"]+state["pnl_acumulado"],4); state["cofre_op"]=round(state["pnl_acumulado"],4)
     state["history"].insert(0, {"lado":o["lado"],"tipo":"GRID-FLUT","entrada":o["ref"],"saida":exit_price,"pnl":pnl,"motivo":motivo+(" - OKX "+("DEMO" if is_teste() else "REAL") if executar_okx() else " - PAPEL"),"hora":now(),"origem":o.get("origem","GRID")})
     state["history"]=state["history"][:200]; return pnl
+def close_resgate(o, price):
+    # SOLUCAO RESGATE: fecha a negativa a 0.0000 no Historico. Cofre paga. Total nao cai.
+    custo = abs(o.get("pnl",0))
+    cofre = state.get("cofre_resgate",0)
+    if cofre < custo or custo<=0: return False
+    # Fecha na OKX se for real - se falhar, nao desconta Cofre
+    if executar_okx():
+        d, err = okx_close_market(o["lado"], o.get("sz"))
+        if err:
+            state["erro_bybit"]=f"Falha a fechar resgate na OKX ({o['lado']}): {err}"
+            return False
+        try: price=float(d["data"][0].get("fillPx") or price)
+        except: pass
+    # Desconta Cofre, nao toca em pnl_acumulado
+    state["cofre_resgate"]=round(max(0, cofre-custo),4)
+    state["history"].insert(0, {"lado":o["lado"],"tipo":"GRID-FLUT","entrada":o["ref"],"saida":price,"pnl":0.0,"motivo":f"Resgate - paga por Cofre {custo:.4f} - fecha a 0 - OKX {'DEMO' if is_teste() else 'REAL'}" if executar_okx() else f"Resgate - paga por Cofre {custo:.4f} - fecha a 0 - PAPEL","hora":now(),"origem":o.get("origem","GRID")})
+    state["history"]=state["history"][:200]
+    try: state["orders"].remove(o)
+    except: pass
+    return True
 def born_opposite(close_price, lado_fechado, passo):
     if lado_fechado=="LONG": ref=round(close_price-passo,1); return mk_order("SHORT",ref,passo,"REBALANCEAMENTO")
     else: ref=round(close_price+passo,1); return mk_order("LONG",ref,passo,"REBALANCEAMENTO")
 def try_rescue_close(price):
-    # Resgate um a um: se Cofre Resgate paga a negativa mais antiga, fecha-a a zero sem prejuizo (nao conta como perda, ja foi paga)
     neg, _, _ = count_negativas()
     if not neg: return
     mais_antiga = neg[0]
     custo = abs(mais_antiga.get("pnl",0))
     if state.get("cofre_resgate",0) >= custo and custo>0:
-        # Fecha a negativa: o Cofre paga, o PnL acumulado nao cai porque o resgate ja contou os lucros
-        # Na pratica: fecha com o motivo Resgate, e desconta o Cofre
-        res = close_order(mais_antiga, price, f"Resgate - paga por Cofre {state.get('cofre_resgate',0):.4f}")
-        if res is not None:
-            try: state["orders"].remove(mais_antiga)
-            except: pass
-            state["cofre_resgate"]=round(max(0, state.get("cofre_resgate",0)-custo),4)
+        close_resgate(mais_antiga, price)
 def bot_loop():
     while True:
         try:
             p=fetch_price()
             if p>0: state["price"]=p; state["last_update"]=now()
-            if not state["running"]: state["ref"]=p
+            # SOLUCAO 4: Ref segue preco sempre
+            state["ref"]=p
             if state["running"] and state["price"]>0:
-                price=state["price"]; passo=state["settings"]["passo"] or 10; orders=state["orders"]
-                # Dedup
+                price=state["price"]; passo=state["settings"]["passo"] or 15; orders=state["orders"]
                 seen=set(); uniq=[]
                 for o in orders:
                     k=(o["lado"],o["ref"],o["tipo"])
@@ -325,26 +336,13 @@ def bot_loop():
                 alvo=alvo_total(); state["alvo_total"]=alvo
                 if state["pnl_acumulado"]>=alvo and alvo>0: state["encerramento"]=True
                 mn=margem_necessaria()
-                # --- FLUTUANTE: PENDING segue o preco ---
                 for o in list(orders):
                     if o["tipo"]=="PENDING":
-                        if state.get("encerramento"): o["pnl"]=0.0; o["falta"]=100.0; continue
-                        # Distancia ate ativar: LONG ativa quando price>=ref, SHORT quando price<=ref
+                        if state.get("encerramento"): o["pnl"]=0.0; o["falta_pts"]=0.0; continue
                         dist = (o["ref"]-price) if o["lado"]=="LONG" else (price-o["ref"])
-                        # Se esta perto (menos de metade do passo), congela - preco vem para ativar
-                        if dist <= passo*0.5 and dist>=-passo:
-                            o["congelada"]=True
-                        else:
-                            o["congelada"]=False
-                            # Segue o preco: LONG fica sempre a 1 passo acima, SHORT a 1 passo abaixo
-                            # Mas mantem a escada: cada PENDING tem um indice - usamos o rank para nao colapsar todas no mesmo ponto
-                            # Simplificacao agressiva: as 2 mais perto ficam a 1 passo, as seguintes a 2,3... passos - recalcula pela ordem
-                            pass
-                        # Recicla PENDING morta: a mais de 50 do preco
-                        if abs(o["ref"]-price)>50:
-                            # Recria perto: vai ser reposicionada em baixo pela escada flutuante
-                            o["congelada"]=False
-                # Reposiciona escada flutuante: LONGs a price+passo, +2passo... SHORTs a price-passo, -2passo... exceto congeladas
+                        if dist <= passo*0.5 and dist>=-passo: o["congelada"]=True
+                        else: o["congelada"]=False
+                        if abs(o["ref"]-price)>50: o["congelada"]=False
                 longs_sorted=sorted([x for x in orders if x["lado"]=="LONG" and x["tipo"]=="PENDING" and not x.get("congelada")], key=lambda x: x["ref"])
                 for idx, o in enumerate(longs_sorted):
                     novo=round(price+(idx+1)*passo,1)
@@ -353,15 +351,13 @@ def bot_loop():
                 for idx, o in enumerate(shorts_sorted):
                     novo=round(price-(idx+1)*passo,1)
                     o["ref"]=novo; o["entrada"]=novo; o["alvo"]=round(novo-passo,1)
-                # --- ATIVACAO IMEDIATA, sem atraso, com controlo negativas ---
                 for o in list(orders):
                     if o["tipo"]=="PENDING":
                         if state.get("encerramento"): continue
                         toca=(o["lado"]=="LONG" and price>=o["ref"]) or (o["lado"]=="SHORT" and price<=o["ref"])
                         if toca:
                             if not pode_abrir_lado(o["lado"]):
-                                # Bloqueado por controlo negativas: continua flutuante, nao ativa, nao fica parado
-                                o["congelada"]=False; o["trava"]="BLOQUEADO - NEGATIVAS NO LIMITE - RESGATE"
+                                o["congelada"]=False; o["trava"]="BLOQUEADO - 2 NEGATIVAS MAX - RESGATE"
                                 continue
                             if saldo_livre()>=mn:
                                 if executar_okx():
@@ -374,16 +370,13 @@ def bot_loop():
                                 else:
                                     slip=random.uniform(0.5,1); fill=round(price+slip,1) if o["lado"]=="LONG" else round(price-slip,1)
                                     o["tipo"]="ACTIVE"; o["preco_fill"]=fill; o["best"]=fill; o["armado"]=False; o["armado_em"]=None; o["ativar_em"]=None; s_str,_,_=calc_sz(fill); o["sz"]=s_str
-                                # Repoe PENDING flutuante no lugar da que ativou
                                 if not state.get("encerramento"): add_order_keep_cap(mk_order(o["lado"], round(price+passo,1) if o["lado"]=="LONG" else round(price-passo,1), passo, "FLUT-REPOSICAO"))
-                        elif not toca: o["pnl"]=0.0; o["falta"]=100.0; o["trava"]=""
-                # --- ACTIVE: trava 40%, recuo 7% ---
+                        elif not toca: o["pnl"]=0.0; o["falta_pts"]=0.0; o["trava"]=""
                 for o in list(orders):
                     if o["tipo"]=="ACTIVE":
                         mov=(price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-price)
-                        prog=mov/passo if passo else 0
-                        if prog>=0: o["falta"]=round(100*(1-prog),1) if prog<1 else 0.0
-                        else: o["falta"]=round(abs(prog)*100,1)
+                        # SOLUCAO 5: Falta em pontos
+                        o["falta_pts"]=round(abs(mov),1) if mov<0 else round(max(0, passo-mov),1)
                         if executar_okx():
                             try: sz_f=float(o.get("sz") or 0)
                             except: sz_f=0
@@ -396,12 +389,17 @@ def bot_loop():
                                 else: o["best"]=min(o["best"],price)
                             passou=(price>=o["alvo"]) if o["lado"]=="LONG" else (price<=o["alvo"])
                             if passou: o["passou_alvo"]=True
-                            if prog>=0.40 and not o.get("armado"): o["armado"]=True; o["armado_em"]=price; o["trava"]="TRAVA ARMADA 40%"
+                            if mov/passo>=0.40 and not o.get("armado"): o["armado"]=True; o["armado_em"]=price; o["trava"]="TRAVA ARMADA 40%"
                             elif o.get("armado"): o["trava"]="TRAVA ARMADA 40%"
                             if o.get("armado") and o.get("best") is not None:
-                                recuo=abs(price-o["best"]); limite=0.07*passo
+                                recuo=abs(price-o["best"]); limite=0.20*passo
                                 if recuo>=limite:
-                                    res=close_order(o,price,"Trava 7%")
+                                    # SOLUCAO 2: Trava nao fecha negativo - estima antes
+                                    pnl_est=estimar_pnl(o, price)
+                                    if pnl_est<=0:
+                                        o["trava"]="TRAVA ARMADA - ESPERA LUCRO, NAO FECHA NEGATIVO"
+                                        continue
+                                    res=close_order(o,price,"Trava 20%")
                                     if res is None: break
                                     orders.remove(o)
                                     if not state.get("encerramento"): add_order_keep_cap(born_opposite(price,o["lado"],passo))
@@ -409,7 +407,6 @@ def bot_loop():
                         else:
                             if o.get("pnl",0) < -LIMITE_NEG_USDT: o["trava"]="NEGATIVA - RESGATE FORCADO - NAO FECHA"
                             else: o["trava"]="A ESPERA - NAO FECHA NEGATIVA - RESGATE"
-                # Resgate: tenta fechar a negativa mais antiga se o Cofre pagar
                 try_rescue_close(price)
                 if state.get("encerramento"):
                     ativos=[x for x in orders if x["tipo"]=="ACTIVE"]
@@ -433,11 +430,11 @@ HTML='''
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ND-SCALPING</title><style>
 *{box-sizing:border-box}body{margin:0;background:#0f1115;color:#fff;font-family:Arial,sans-serif;padding-bottom:90px}.top{background:#1a1d24;padding:10px 12px;position:sticky;top:0}.top b{color:#2ecc71;font-size:22px}.papel{color:#ff8c00;font-weight:bold}.teste{color:#3498db;font-weight:bold}.real{color:#e74c3c;font-weight:bold}.small{color:#aaa;font-size:12px}.card{background:#1a1d24;margin:10px;border-radius:10px;padding:12px}.green{color:#2ecc71}.red{color:#e74c3c}.big{font-size:26px;font-weight:bold}.grid{display:flex;gap:8px}.box{flex:1;border-radius:8px;padding:8px}.short{background:#3a1414}.long{background:#12331f}.refbar{background:#f1c40f;color:#000;text-align:center;padding:6px;border-radius:6px;font-weight:bold;margin:8px 0}.ord{border-bottom:1px solid #333;padding:6px 0;font-size:13px}.btn{width:100%;padding:14px;border:0;border-radius:8px;font-weight:bold;font-size:16px;cursor:pointer}.btn-start{background:#2ecc71;color:#fff}.btn-stop{background:#e74c3c;color:#fff}.btn-save{background:#3498db;color:#fff;padding:12px}.inp{width:100%;padding:10px;border-radius:6px;border:1px solid #333;background:#0f1115;color:#fff;margin:4px 0 10px}label{font-size:13px;color:#ddd}.tabs{position:fixed;bottom:0;left:0;right:0;display:flex;background:#1a1d24;border-top:1px solid #333}.tabs button{flex:1;padding:14px;background:none;border:0;color:#aaa;font-weight:bold}.tabs button.on{color:#2ecc71}.hidden{display:none}.trava{color:#f1c40f;font-size:11px}.histline{border-bottom:1px solid #333;padding:6px 0;font-size:13px}.enc{background:#f1c40f;color:#000;padding:6px;border-radius:6px;font-weight:bold;text-align:center;margin-top:6px}.chaves{padding:6px;border-radius:6px;font-weight:bold;margin-top:6px;background:#12331f}.erro{color:#e74c3c;font-size:12px}.exec{background:#3498db;color:#fff;padding:6px;border-radius:6px;font-weight:bold;margin-top:6px;text-align:center}
 </style></head><body>
-<div class="top"><b>ND-SCALPING</b> <span id="topConta" class="papel">PAPEL</span> <span id="topCorr" class="small"></span><div class="small">Atualizado: <span id="upd">--</span> | Fonte: <span id="fonte">--</span> | Taxa 0.055% | Slippage 0.5-1 | Ativacao imediata | Trava 40% / Recuo 7% | FLUTUANTE</div></div>
+<div class="top"><b>ND-SCALPING</b> <span id="topConta" class="papel">PAPEL</span> <span id="topCorr" class="small"></span><div class="small">Atualizado: <span id="upd">--</span> | Fonte: <span id="fonte">--</span> | Taxa 0.055% | Slippage 0.5-1 | Trava 40% / Recuo 20% | FLUTUANTE | SOLUCAO RESGATE</div></div>
 <div id="tab-dash">
-<div class="card"><b>STATUS - ANALISE <span id="corrNome"></span></b><div id="status"></div><div id="execBox"></div><div id="encBox"></div><div id="chavesBox"></div><div id="erroBox"></div><div id="loteBox"></div><div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap"><div><div class="small">SALDO TOTAL DA CONTA - Trading + Funding</div><div class="big" id="saldoConta">--</div></div><div><div class="small">SALDO EM OPERACAO</div><div class="big" id="saldoOp">--</div></div><div><div class="small">RESERVA</div><div class="big" id="reserva">--</div></div></div><div class="small">Conta = Inicio +/- PnL | Operacao = Inicio +/- PnL | Cofre Op = <span id="cofreOp"></span> | Cofre Resgate = <span id="cofreResg"></span> | Cofre Global = <span id="cofreG"></span> | Margem necess. = <span id="margNec"></span> | Alvo = <span id="alvoTxt"></span> | Fonte Saldo: <span id="fonteSaldo"></span> | Passo sug. <span id="passoSug"></span> | Negativas: <span id="negTxt"></span></div></div>
-<div class="card"><b>POSICAO ATUAL - AO VIVO</b><div id="pos"></div><button id="mainBtn" class="btn btn-start" onclick="toggle()">INICIAR BOT</button><div class="small">TESTE = Demo OKX Futures BTC-USDT-SWAP. REAL = Real OKX Futures. PAPEL = nao manda nada. Ver ordens em Trade > Futures, nao em Spot. FLUTUANTE: PENDING segue o preco a 1 passo.</div></div>
-<div class="card"><b>GRID FLUTUANTE — REF NO CENTRO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">PENDING flutuante: segue preco a 1 passo, so congela quando preco vem para ativar. Trava 40%. Recuo 7%. Max 3 negativas, max 2 por lado. Resgate um a um.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
+<div class="card"><b>STATUS - ANALISE <span id="corrNome"></span></b><div id="status"></div><div id="execBox"></div><div id="encBox"></div><div id="chavesBox"></div><div id="erroBox"></div><div id="loteBox"></div><div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap"><div><div class="small">CONTA OKX DEMO/REAL - USDT Trading + Funding</div><div class="big" id="saldoConta">--</div></div><div><div class="small">OPERACAO - BALDE VIRTUAL</div><div class="big" id="saldoOp">--</div></div><div><div class="small">RESERVA = CONTA - OPERACAO</div><div class="big" id="reserva">--</div></div></div><div class="small">Conta = Inicio +/- PnL | Operacao = Inicio +/- PnL | Cofre Op = <span id="cofreOp"></span> | Cofre Resgate = <span id="cofreResg"></span> | Cofre Global = <span id="cofreG"></span> | Margem necess. = <span id="margNec"></span> | Alvo = <span id="alvoTxt"></span> | Fonte Saldo: <span id="fonteSaldo"></span> | Passo sug. <span id="passoSug"></span> | Negativas: <span id="negTxt"></span></div></div>
+<div class="card"><b>POSICAO ATUAL - AO VIVO</b><div id="pos"></div><button id="mainBtn" class="btn btn-start" onclick="toggle()">INICIAR BOT</button><div class="small">TESTE = Demo OKX Futures BTC-USDT-SWAP. REAL = Real OKX Futures. PAPEL = nao manda nada. Ver ordens em Trade > Futures, nao em Spot. FLUTUANTE: PENDING segue o preco a 1 passo. RESGATE: negativa fecha a 0 quando Cofre paga.</div></div>
+<div class="card"><b>GRID FLUTUANTE — REF = PRECO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">PENDING flutuante: segue preco a 1 passo, so congela quando preco vem para ativar. Trava 40%. Recuo 20%. Max 2 negativas total, max 1 por lado. Trava nao fecha negativo.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
 </div>
 <div id="tab-merc" class="hidden"><div class="card"><b>MERCADO - GRAFICO</b><div id="merc"></div><div style="position:relative;height:160px;background:#0a2a4a;border-radius:8px;overflow:hidden;margin:8px 0"><div id="priceLine" style="position:absolute;left:0;right:0;height:2px;background:#fff"></div><div id="refLine" style="position:absolute;left:0;right:0;height:2px;background:#f1c40f"></div><div id="ordDots"></div><div id="priceLabel" style="position:absolute;right:6px;background:#fff;color:#000;padding:2px 6px;border-radius:4px;font-size:12px;font-weight:bold"></div></div><div class="small">Linha branca = Preço | Linha amarela = Ref | Verde = LONG | Vermelho = SHORT | Trajetoria: <span id="traj"></span></div><div><b>ORDENS ABERTAS</b><div id="contagem"></div></div></div></div>
 <div id="tab-hist" class="hidden"><div class="card"><b>HISTORICO</b><div><label>ESCOLHE O DIA</label><input class="inp" type="date" id="dia"></div><div id="histResumo"></div><div id="hist"></div></div></div>
@@ -449,18 +446,18 @@ HTML='''
 <label>SALDO DA OPERACAO (USDT)</label><input class="inp" id="f_saldo_op">
 <label>MARGEM POR ORDEM</label><input class="inp" id="f_margem">
 <label>ALAVANCAGEM (1 A 20)</label><input class="inp" id="f_alav">
-<label>ESPACAMENTO GRID - PASSO - AGRESSIVO BTC 10, ETH 3, SOL 1, XRP 0.02, DOGE 0.003</label><input class="inp" id="f_passo">
+<label>ESPACAMENTO GRID - PASSO - SOLUCAO BTC 15, ETH 3, SOL 1, XRP 0.02, DOGE 0.003</label><input class="inp" id="f_passo">
 <label>NUMERO TOTAL DE ORDENS</label><input class="inp" id="f_total">
 <label>LUCRO POR OPERACAO (USDT)</label><input class="inp" id="f_lucro">
 <label>MODO</label><select class="inp" id="f_modo"><option value="Manual">Manual</option><option value="Automatico">Automatico</option></select>
 <label>OPERACOES POR DIA - AUTOMATICO: ALVO = LUCRO X OPERACOES</label><input class="inp" id="f_ops">
-<button class="btn btn-save" onclick="salvar()">GUARDAR</button><div class="small">OKX: TESTE = chaves Demo. REAL = chaves Reais. Read + Trade, sem Withdraw. Controlo negativas: max 3 total, max 2 por lado, resgate forcado acima de -5 USDT.</div></div></div>
+<button class="btn btn-save" onclick="salvar()">GUARDAR</button><div class="small">OKX: TESTE = chaves Demo. REAL = chaves Reais. Read + Trade, sem Withdraw. Max 2 negativas total, max 1 por lado, resgate forcado acima de -0.50 USDT.</div></div></div>
 <div class="tabs"><button onclick="tab('dash',this)" class="on">Dashboard</button><button onclick="tab('merc',this)">Mercado</button><button onclick="tab('hist',this)">Historico</button><button onclick="tab('aj',this)">Ajustes</button></div>
 <script>
 let S={}; let ajPreenchido=false;
 function tab(n,el){['dash','merc','hist','aj'].forEach(x=>document.getElementById('tab-'+x).classList.toggle('hidden',x!==n));document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));el.classList.add('on')}
-function faltaTxt(o){if(o.tipo!=='ACTIVE') return `Falta ${o.falta}% para o alvo ${o.congelada?'• CONGELADA - PRECO A VIR': '• FLUTUANTE'}`; if(o.pnl<0) return `Falta ${o.falta}% para voltar a 0 - RESGATE`; return `Falta ${o.falta}% para o alvo ${o.passou_alvo?'• PASSOU ALVO - INFINITO':''}`}
-async function load(){let r=await fetch('/api/state');S=await r.json();document.getElementById('upd').textContent=S.last_update;document.getElementById('fonte').textContent=S.fonte;let tc=document.getElementById('topConta');tc.textContent=S.settings.conta;tc.className=S.settings.conta==='REAL'?'real':(S.settings.conta==='TESTE'?'teste':'papel');document.getElementById('topCorr').textContent=S.settings.corretora+' • '+S.settings.moeda+'/USDT • '+S.settings.modo;document.getElementById('corrNome').textContent=S.settings.corretora+' • '+S.settings.moeda;let st=document.getElementById('saldoConta');st.textContent=S.saldo_conta.toFixed(4);st.className='big '+(S.saldo_conta>=0?'green':'red');let so=document.getElementById('saldoOp');so.textContent=S.saldo_op.toFixed(4);so.className='big '+(S.saldo_op>=0?'green':'red');let rv=document.getElementById('reserva');rv.textContent=S.reserva.toFixed(4);rv.className='big '+(S.reserva>=0?'green':'red');document.getElementById('cofreOp').textContent=(S.cofre_op>=0?'+':'')+S.cofre_op.toFixed(4);document.getElementById('cofreResg').textContent=S.cofre_resgate.toFixed(4);document.getElementById('cofreG').textContent=S.cofre_global.toFixed(4);document.getElementById('margNec').textContent=S.margem_necessaria.toFixed(4)+' USDT';document.getElementById('alvoTxt').textContent=S.alvo_total.toFixed(4)+' USDT ('+S.settings.modo+')';document.getElementById('fonteSaldo').textContent=S.fonte_saldo;document.getElementById('passoSug').textContent=S.passo_sug;document.getElementById('negTxt').textContent=S.negativas+' negativas (max 3, max 2/lado)';document.getElementById('execBox').innerHTML=`<div class="exec">${S.execucao}</div>`;document.getElementById('loteBox').innerHTML=`<div class="small" style="color:#f1c40f">LOTE OKX: ${S.lote_info} | Sz exemplo: ${S.sz_exemplo||''} contratos | FLUTUANTE ATIVO</div>`;document.getElementById('chavesBox').innerHTML=`<div class="chaves">CORRETORA: ${S.settings.corretora} | CONTA: ${S.settings.conta} | MOEDA: ${S.settings.moeda} | CHAVES: ${S.chaves} | Fonte Saldo: ${S.fonte_saldo} ${S.saldo_conta_real!==null&&S.saldo_conta_real!==undefined?'| Saldo: '+S.saldo_conta_real:''}</div>`;document.getElementById('erroBox').innerHTML=S.erro_bybit?`<div class="erro">ERRO OKX: ${S.erro_bybit}</div>`:'';document.getElementById('encBox').innerHTML=S.encerramento?'<div class="enc">ENCERRAMENTO - Atingiu o alvo '+S.alvo_total+'. Parou de abrir novas.</div>':'';let pnlTot=S.saldo_op - S.saldo_op_inicio;document.getElementById('status').innerHTML=`<div class="${S.running?'green':'red'}">${S.running?'A OPERAR - FLUTUANTE':'PARADO'}</div><div class="small">Par: ${S.settings.moeda}/USDT | Preco: ${S.price} | Ref: ${S.ref} | Modo: ${S.settings.conta} | Futures ${S.settings.moeda}-USDT-SWAP</div><div style="background:#12331f;padding:6px;border-radius:6px;margin-top:6px">GRID FLUTUANTE - Total ${S.orders.length} / ${S.settings.total_ordens} | Negativas: ${S.negativas}</div>`;document.getElementById('pos').innerHTML=`<div>Preco: ${S.price} | Ref: ${S.ref}</div><div class="big ${pnlTot>=0?'green':'red'}">${pnlTot>=0?'+':''}${pnlTot.toFixed(4)} USDT — P&L total</div><div class="small">P&L vivo ACTIVE: ${S.pnl.toFixed(4)} | Cofre Op: ${S.cofre_op.toFixed(4)} | Cofre Resgate: ${S.cofre_resgate.toFixed(4)} | Cofre Global: ${S.cofre_global.toFixed(4)} | PnL acumulado: ${S.pnl_acumulado}</div><div>Saldo Op: ${S.saldo_op} | Em uso: ${S.em_uso} | Livre: ${(S.saldo_op - S.em_uso).toFixed(4)} | Margem necess.: ${S.margem_necessaria} | Sz por ordem: ${S.sz_exemplo||''} contratos</div>`;document.getElementById('refbar').textContent=`Ref: ${S.ref} • Preço: ${S.price}`;document.getElementById('merc').innerHTML=`Preco: ${S.price} | Ref: ${S.ref} | Moeda: ${S.settings.moeda}`;document.getElementById('traj').textContent=S.trajetoria;document.getElementById('contagem').textContent=`${S.orders.length} / ${S.settings.total_ordens} | ${S.orders.filter(o=>o.tipo==='ACTIVE').length} ACTIVE | ${S.orders.filter(o=>o.tipo==='PENDING').length} PENDING`;let sh=S.orders.filter(o=>o.lado==='SHORT').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.okx_ord_id? '• OKX '+o.okx_ord_id.slice(0,8):''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)} • Sz ${o.sz||''}<br>${faltaTxt(o)}</div>`).join('')||'—';let lo=S.orders.filter(o=>o.lado==='LONG').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.okx_ord_id? '• OKX '+o.okx_ord_id.slice(0,8):''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)} • Sz ${o.sz||''}<br>${faltaTxt(o)}</div>`).join('')||'—';document.getElementById('shorts').innerHTML=sh;document.getElementById('longs').innerHTML=lo;let btn=document.getElementById('mainBtn');btn.textContent=S.running?'PARAR ROBÔ':'INICIAR BOT';btn.className='btn '+(S.running?'btn-stop':'btn-start');let tot=S.pnl_acumulado;document.getElementById('histResumo').innerHTML=`<div class="big ${tot>=0?'green':'red'}">${tot>=0?'+':''}${tot.toFixed(4)} USDT — total</div><div class="small">LONG: ${S.pnl_long.toFixed(4)} + SHORT: ${S.pnl_short.toFixed(4)} = ${tot.toFixed(4)}</div>`;document.getElementById('hist').innerHTML=S.history.map(x=>`<div class="histline">${x.lado} GRID-FLUT | ${x.hora} | ${x.pnl>=0?'+':''}${x.pnl} USDT<br>${x.entrada} → ${x.saida} • ${x.motivo}</div>`).join('');let refs=S.orders.length?S.orders.map(o=>o.ref):[S.ref];let mn=Math.min(...refs,S.price)-50;let mx=Math.max(...refs,S.price)+50;let posP=(1-(S.price-mn)/(mx-mn))*100;let posR=(1-(S.ref-mn)/(mx-mn))*100;let pl=document.getElementById('priceLine');pl.style.top=posP+'%';let rl=document.getElementById('refLine');rl.style.top=posR+'%';let lbl=document.getElementById('priceLabel');lbl.style.top=(posP-8)+'px';lbl.textContent=S.price;let dots=S.orders.filter(o=>o.tipo==='ACTIVE').map(o=>{let y=(1-(o.ref-mn)/(mx-mn))*100;let c=o.lado==='LONG'?'#2ecc71':'#e74c3c';return `<div style="position:absolute;left:${o.lado==='LONG'?'20%':'70%'};top:${y}%;width:10px;height:10px;border-radius:50%;background:${c}"></div>`}).join('');document.getElementById('ordDots').innerHTML=dots;if(!ajPreenchido){ajPreenchido=true;document.getElementById('f_corretora').value=S.settings.corretora;document.getElementById('f_conta_tipo').value=S.settings.conta;document.getElementById('f_moeda').value=S.settings.moeda;document.getElementById('f_conta').value=S.settings.saldo_conta;document.getElementById('f_saldo_op').value=S.settings.saldo_op;document.getElementById('f_margem').value=S.settings.margem;document.getElementById('f_alav').value=S.settings.alav;document.getElementById('f_passo').value=S.settings.passo;document.getElementById('f_total').value=S.settings.total_ordens;document.getElementById('f_lucro').value=S.settings.lucro_op;document.getElementById('f_modo').value=S.settings.modo;document.getElementById('f_ops').value=S.settings.ops_dia;}}
+function faltaTxt(o){if(o.tipo!=='ACTIVE') return `Falta ${(o.falta_pts||0).toFixed(1)} pontos para o alvo ${o.congelada?'• CONGELADA - PRECO A VIR': '• FLUTUANTE'}`; if(o.pnl<0) return `Falta ${(o.falta_pts||0).toFixed(1)} pontos para voltar a 0 - RESGATE`; return `Falta ${(o.falta_pts||0).toFixed(1)} pontos para o alvo ${o.passou_alvo?'• PASSOU ALVO - INFINITO':''}`}
+async function load(){let r=await fetch('/api/state');S=await r.json();document.getElementById('upd').textContent=S.last_update;document.getElementById('fonte').textContent=S.fonte;let tc=document.getElementById('topConta');tc.textContent=S.settings.conta;tc.className=S.settings.conta==='REAL'?'real':(S.settings.conta==='TESTE'?'teste':'papel');document.getElementById('topCorr').textContent=S.settings.corretora+' • '+S.settings.moeda+'/USDT • '+S.settings.modo;document.getElementById('corrNome').textContent=S.settings.corretora+' • '+S.settings.moeda;let st=document.getElementById('saldoConta');st.textContent=S.saldo_conta.toFixed(4);st.className='big '+(S.saldo_conta>=0?'green':'red');let so=document.getElementById('saldoOp');so.textContent=S.saldo_op.toFixed(4);so.className='big '+(S.saldo_op>=0?'green':'red');let rv=document.getElementById('reserva');rv.textContent=S.reserva.toFixed(4);rv.className='big '+(S.reserva>=0?'green':'red');document.getElementById('cofreOp').textContent=(S.cofre_op>=0?'+':'')+S.cofre_op.toFixed(4);document.getElementById('cofreResg').textContent=S.cofre_resgate.toFixed(4);document.getElementById('cofreG').textContent=S.cofre_global.toFixed(4);document.getElementById('margNec').textContent=S.margem_necessaria.toFixed(4)+' USDT';document.getElementById('alvoTxt').textContent=S.alvo_total.toFixed(4)+' USDT ('+S.settings.modo+')';document.getElementById('fonteSaldo').textContent=S.fonte_saldo;document.getElementById('passoSug').textContent=S.passo_sug;document.getElementById('negTxt').textContent=S.negativas+' negativas (max 2 total, max 1/lado)';document.getElementById('execBox').innerHTML=`<div class="exec">${S.execucao}</div>`;document.getElementById('loteBox').innerHTML=`<div class="small" style="color:#f1c40f">LOTE OKX: ${S.lote_info} | Sz exemplo: ${S.sz_exemplo||''} contratos | FLUTUANTE + SOLUCAO RESGATE</div>`;document.getElementById('chavesBox').innerHTML=`<div class="chaves">CORRETORA: ${S.settings.corretora} | CONTA: ${S.settings.conta} | MOEDA: ${S.settings.moeda} | CHAVES: ${S.chaves} | Fonte Saldo: ${S.fonte_saldo} ${S.saldo_conta_real!==null&&S.saldo_conta_real!==undefined?'| Saldo: '+S.saldo_conta_real:''}</div>`;document.getElementById('erroBox').innerHTML=S.erro_bybit?`<div class="erro">ERRO OKX: ${S.erro_bybit}</div>`:'';document.getElementById('encBox').innerHTML=S.encerramento?'<div class="enc">ENCERRAMENTO - Atingiu o alvo '+S.alvo_total+'. Parou de abrir novas.</div>':'';let pnlTot=S.saldo_op - S.saldo_op_inicio;document.getElementById('status').innerHTML=`<div class="${S.running?'green':'red'}">${S.running?'A OPERAR - FLUTUANTE':'PARADO'}</div><div class="small">Par: ${S.settings.moeda}/USDT | Preco: ${S.price} | Ref: ${S.ref} (= Preco) | Modo: ${S.settings.conta} | Futures ${S.settings.moeda}-USDT-SWAP</div><div style="background:#12331f;padding:6px;border-radius:6px;margin-top:6px">GRID FLUTUANTE - Total ${S.orders.length} / ${S.settings.total_ordens} | Negativas: ${S.negativas} / 2 max</div>`;document.getElementById('pos').innerHTML=`<div>Preco: ${S.price} | Ref: ${S.ref}</div><div class="big ${pnlTot>=0?'green':'red'}">${pnlTot>=0?'+':''}${pnlTot.toFixed(4)} USDT — P&L total</div><div class="small">P&L vivo ACTIVE: ${S.pnl.toFixed(4)} | Cofre Op: ${S.cofre_op.toFixed(4)} | Cofre Resgate: ${S.cofre_resgate.toFixed(4)} | Cofre Global: ${S.cofre_global.toFixed(4)} | PnL acumulado: ${S.pnl_acumulado}</div><div>Saldo Op: ${S.saldo_op} | Em uso: ${S.em_uso} | Livre: ${(S.saldo_op - S.em_uso).toFixed(4)} | Margem necess.: ${S.margem_necessaria} | Sz por ordem: ${S.sz_exemplo||''} contratos</div>`;document.getElementById('refbar').textContent=`Ref: ${S.ref} • Preço: ${S.price} (Ref = Preco)`;document.getElementById('merc').innerHTML=`Preco: ${S.price} | Ref: ${S.ref} | Moeda: ${S.settings.moeda}`;document.getElementById('traj').textContent=S.trajetoria;document.getElementById('contagem').textContent=`${S.orders.length} / ${S.settings.total_ordens} | ${S.orders.filter(o=>o.tipo==='ACTIVE').length} ACTIVE | ${S.orders.filter(o=>o.tipo==='PENDING').length} PENDING`;let sh=S.orders.filter(o=>o.lado==='SHORT').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.okx_ord_id? '• OKX '+o.okx_ord_id.slice(0,8):''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)} • Sz ${o.sz||''}<br>${faltaTxt(o)}</div>`).join('')||'—';let lo=S.orders.filter(o=>o.lado==='LONG').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.okx_ord_id? '• OKX '+o.okx_ord_id.slice(0,8):''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)} • Sz ${o.sz||''}<br>${faltaTxt(o)}</div>`).join('')||'—';document.getElementById('shorts').innerHTML=sh;document.getElementById('longs').innerHTML=lo;let btn=document.getElementById('mainBtn');btn.textContent=S.running?'PARAR ROBÔ':'INICIAR BOT';btn.className='btn '+(S.running?'btn-stop':'btn-start');let tot=S.pnl_acumulado;document.getElementById('histResumo').innerHTML=`<div class="big ${tot>=0?'green':'red'}">${tot>=0?'+':''}${tot.toFixed(4)} USDT — total</div><div class="small">LONG: ${S.pnl_long.toFixed(4)} + SHORT: ${S.pnl_short.toFixed(4)} = ${tot.toFixed(4)}</div>`;document.getElementById('hist').innerHTML=S.history.map(x=>`<div class="histline">${x.lado} GRID-FLUT | ${x.hora} | ${x.pnl>=0?'+':''}${x.pnl} USDT<br>${x.entrada} → ${x.saida} • ${x.motivo}</div>`).join('');let refs=S.orders.length?S.orders.map(o=>o.ref):[S.ref];let mn=Math.min(...refs,S.price)-50;let mx=Math.max(...refs,S.price)+50;let posP=(1-(S.price-mn)/(mx-mn))*100;let posR=(1-(S.ref-mn)/(mx-mn))*100;let pl=document.getElementById('priceLine');pl.style.top=posP+'%';let rl=document.getElementById('refLine');rl.style.top=posR+'%';let lbl=document.getElementById('priceLabel');lbl.style.top=(posP-8)+'px';lbl.textContent=S.price;let dots=S.orders.filter(o=>o.tipo==='ACTIVE').map(o=>{let y=(1-(o.ref-mn)/(mx-mn))*100;let c=o.lado==='LONG'?'#2ecc71':'#e74c3c';return `<div style="position:absolute;left:${o.lado==='LONG'?'20%':'70%'};top:${y}%;width:10px;height:10px;border-radius:50%;background:${c}"></div>`}).join('');document.getElementById('ordDots').innerHTML=dots;if(!ajPreenchido){ajPreenchido=true;document.getElementById('f_corretora').value=S.settings.corretora;document.getElementById('f_conta_tipo').value=S.settings.conta;document.getElementById('f_moeda').value=S.settings.moeda;document.getElementById('f_conta').value=S.settings.saldo_conta;document.getElementById('f_saldo_op').value=S.settings.saldo_op;document.getElementById('f_margem').value=S.settings.margem;document.getElementById('f_alav').value=S.settings.alav;document.getElementById('f_passo').value=S.settings.passo;document.getElementById('f_total').value=S.settings.total_ordens;document.getElementById('f_lucro').value=S.settings.lucro_op;document.getElementById('f_modo').value=S.settings.modo;document.getElementById('f_ops').value=S.settings.ops_dia;}}
 async function toggle(){if(S.running){await fetch('/api/toggle',{method:'POST'});ajPreenchido=false;load();return} if(S.settings.conta==='REAL'){if(!confirm('ATENCAO: Vais operar com DINHEIRO REAL na OKX. Confirmas?')) return} if(S.settings.conta==='TESTE'){if(!confirm('Vais operar na DEMO OKX Futures com ordens reais na Demo. Confirmas?')) return} await fetch('/api/toggle',{method:'POST'});ajPreenchido=false;load()}
 async function salvar(){let b={corretora:document.getElementById('f_corretora').value,conta:document.getElementById('f_conta_tipo').value,moeda:document.getElementById('f_moeda').value,saldo_conta:parseFloat(document.getElementById('f_conta').value),saldo_op:parseFloat(document.getElementById('f_saldo_op').value),margem:parseFloat(document.getElementById('f_margem').value),alav:parseFloat(document.getElementById('f_alav').value),passo:parseFloat(document.getElementById('f_passo').value),total_ordens:parseFloat(document.getElementById('f_total').value),lucro_op:parseFloat(document.getElementById('f_lucro').value),modo:document.getElementById('f_modo').value,ops_dia:parseFloat(document.getElementById('f_ops').value)};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert('Guardado');ajPreenchido=false;load()}
 setInterval(load,1500);load();
