@@ -1,23 +1,27 @@
-# ND-SCALPING V6 - SALDO CERTO
-# PORQUE NUNCA BATIA: Bot mostrava 61016.72 = Trading USDT + Funding 0. OKX Assets mostrava Est total 75455.34, USDT Equity 60970.35, In use 491.83, Available 60478.51, mais OKB 8222.74 + BTC 4557.29 + ETH 1704.95. Bot lia SO USDT, OKX mostra TOTAL em USD de todas as moedas. Sao 2 numeros diferentes. E bot fazia Reserva = Conta Real 61016 - Operacao Virtual 25 = 60991, que nao existe em lado nenhum. Reserva nao pode ser Real menos Virtual.
-# FIX SALDO: Bot agora le 3 numeros separados da OKX e mostra os 3 com os mesmos nomes da OKX:
-# 1) Est total value USD = soma eqUsd de todas as moedas em /api/v5/account/balance (USDT+OKB+BTC+ETH...). E o numero grande da OKX Assets: 75455.
-# 2) USDT Equity = eq do USDT. E o 60970 da OKX.
-# 3) USDT Available = availBal do USDT. E o 60478 da OKX.
-# 4) USDT In use = Equity - Available, ou upl + frozen. E o 491 da OKX.
-# 5) Funding USDT = /api/v5/asset/balances, separado, nao somado ao Trading para nao contar 2x.
-# FIX COFRE GLOBAL: Cofre Global = Est total value USD, nao = USDT. Atualiza a cada sync, nao congela no toggle.
-# FIX RESERVA: Reserva nao e Conta - Operacao Virtual. Reserva = USDT Available da OKX (60478). Operacao Virtual (25 + PnL) fica separada, nao subtrai da conta real. Mostra os dois lado a lado sem misturar.
-# FIX CONTA: Conta no Dashboard = Est total value USD + USDT Equity + USDT Available + In use. Se OKX diz 75455, bot diz 75455. Se OKX diz USDT Equity 60970, bot diz 60970.
-# FIX STALE: Cofre Global 61016.7145 vs Conta 61016.7218 diferenca 0.0073 era porque Cofre Global nao atualizava no sync. Agora sync atualiza Conta, Cofre Global, Trading, Funding, Available, In use todos juntos.
-# FIX PNL REAL: Le fills reais OKX, fillPx, fee, fillPnl. Anti-duplicado fecho. Alavancagem mandada para OKX. Trava nao fecha negativo. Max 2 negativas total. Ref = preco. Falta em pontos. Flutuante.
+# ND-SCALPING V6 - REGRAS DO COMECO + FALHAS CORRIGIDAS
+# REGRAS DO COMECO - PINCA FLUTUANTE (as melhores, voltam intactas):
+# 1. GRID FLUTUANTE: 10 LONG acima + 10 SHORT abaixo, a 1 passo do preco. PENDING segue o preco a 1 passo, so congela quando preco vem para ativar.
+# 2. ATIVACAO: Quando preco toca Ref, PENDING vira ACTIVE. Logo a seguir nasce 1 PENDING de reposicao do mesmo lado, a 1 passo.
+# 3. TRAVA: Arma a 40% do passo. Recuo 20% do passo para fechar. Trava NAO fecha negativo - se fecho der negativo, espera.
+# 4. REBALANCEAMENTO: Quando ACTIVE fecha, nasce 1 ordem oposta a 1 passo do fecho.
+# 5. RESGATE: Cofre Resgate = soma dos lucros. Quando Cofre >= custo da negativa + taxa 0.0035, fecha negativa a 0. Cofre baixa, total nao cai. Se Cofre nao cobre o real da OKX, regista o real, nao esconde.
+# 6. MAX NEGATIVAS: Max 2 no total, max 1 LONG negativa + 1 SHORT negativa. Com 2, nao abre mais ACTIVE.
+# 7. REF = PRECO: Ref segue preco sempre.
+# 8. FALTA EM PONTOS: Falta X pontos para voltar a 0 / para o alvo, nao %.
+# 9. SALDO CERTO: Conta = Est total USD OKX. USDT Equity, Available, In use separados. Reserva = Available. Operacao virtual separada, nao subtrai da conta real. Cofre Global = Est total.
+# 10. ALAVANCAGEM: Mandada para OKX ao iniciar, long e short, cross.
+# FALHAS CORRIGIDAS (so estas, resto igual):
+# FALHA A - ORDEM FANTASMA: Bot mudava Ref da PENDING no ecra mas nao cancelava a limite antiga na OKX. Ordem velha ficava e executava sozinha. AGORA: Quando PENDING mexe Ref, cancela ordId antiga na OKX via POST /api/v5/trade/cancel-order e cria nova limite. 1 PENDING no bot = 1 limite na OKX. Ao parar, cancela todas as limites pendentes.
+# FALHA B - BOT NAO VIA POSICOES REAIS: Bot pensava 0.12 contratos, OKX tinha 1.68. AGORA: A cada ciclo le /api/v5/account/positions. Se OKX tem posicao, bot mostra Size, Entry, PnL reais da OKX. Bot nao inventa posicao. Se OKX tem posicao que bot nao tem, cria ACTIVE espelho com Size e Entry reais.
+# FALHA C - FECHO DUPLICADO: AGORA closing=True, nao manda fechar 2x.
+# FALHA D - PNL ESTIMADO: AGORA le fills reais OKX, fillPx, fee, fillPnl.
 # VISUAL ANTIGO. OKX Demo/Real. Chaves Render: OKX_API_KEY + OKX_API_SECRET + OKX_PASSPHRASE.
 import os, json, time, threading, random, hashlib, hmac, urllib.request, urllib.parse, base64, math
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string
 app = Flask(__name__)
-DATA_FILE = "/tmp/nd_v6_saldo.json"
+DATA_FILE = "/tmp/nd_v6_comeco.json"
 def now(): return (datetime.utcnow() + timedelta(hours=1)).strftime("%H:%M:%S")
 def load(): return json.load(open(DATA_FILE)) if os.path.exists(DATA_FILE) else None
 def save(s): open(DATA_FILE,"w").write(json.dumps(s))
@@ -33,7 +37,7 @@ MAP_CONTA = {"papel":"PAPEL","teste":"TESTE","real":"REAL"}
 MAP_MOEDA = {"btc":"BTC","eth":"ETH","sol":"SOL","xrp":"XRP","doge":"DOGE"}
 MAP_MODO = {"manual":"Manual","automatico":"Automatico","automático":"Automatico"}
 def default_state():
-    return {"running":False,"price":0.0,"ref":0.0,"saldo_conta":0.0,"saldo_conta_inicio":0.0,"saldo_conta_real":None,"est_total_usd":0.0,"saldo_trading":0.0,"saldo_funding":0.0,"usdt_equity":0.0,"usdt_available":0.0,"usdt_in_use":0.0,"usdt_upl":0.0,"saldo_op":25.0,"saldo_op_inicio":25.0,"em_uso":0.0,"reserva":0.0,"reserva_okx":0.0,"cofre_op":0.0,"cofre_global":0.0,"cofre_resgate":0.0,"pnl_acumulado":0.0,"pnl_long":0.0,"pnl_short":0.0,"orders":[],"history":[],"encerramento":False,"alvo_total":0.0,"chaves":"A VERIFICAR","fonte_saldo":"Ajustes (PAPEL)","erro_bybit":"","execucao":"PAPEL - Simulacao","lote_info":"A carregar lote OKX...","alav_okx":"--","settings":{"saldo_conta":100.0,"saldo_op":25.0,"margem":5.0,"alav":15,"passo":15,"total_ordens":20,"lucro_op":5,"modo":"Manual","ops_dia":8,"corretora":"Bybit","conta":"PAPEL","moeda":"BTC"},"last_update":"--","fonte":"A ligar...","trajetoria":"a descer"}
+    return {"running":False,"price":0.0,"ref":0.0,"saldo_conta":0.0,"saldo_conta_inicio":0.0,"saldo_conta_real":None,"est_total_usd":0.0,"saldo_trading":0.0,"saldo_funding":0.0,"usdt_equity":0.0,"usdt_available":0.0,"usdt_in_use":0.0,"usdt_upl":0.0,"saldo_op":25.0,"saldo_op_inicio":25.0,"em_uso":0.0,"reserva":0.0,"reserva_okx":0.0,"cofre_op":0.0,"cofre_global":0.0,"cofre_resgate":0.0,"pnl_acumulado":0.0,"pnl_long":0.0,"pnl_short":0.0,"orders":[],"history":[],"encerramento":False,"alvo_total":0.0,"chaves":"A VERIFICAR","fonte_saldo":"Ajustes (PAPEL)","erro_bybit":"","execucao":"PAPEL - Simulacao","lote_info":"A carregar lote OKX...","alav_okx":"--","pos_okx":"A ler posicoes OKX...","settings":{"saldo_conta":100.0,"saldo_op":25.0,"margem":5.0,"alav":15,"passo":15,"total_ordens":20,"lucro_op":5,"modo":"Manual","ops_dia":8,"corretora":"Bybit","conta":"PAPEL","moeda":"BTC"},"last_update":"--","fonte":"A ligar...","trajetoria":"a descer"}
 state = load() or default_state()
 for k,v in default_state().items():
     if k not in state: state[k]=v
@@ -154,12 +158,10 @@ def calc_sz_float(price):
     s, f, _ = calc_sz(price)
     return f
 def okx_balance():
-    # SALDO CERTO: Le tudo da OKX, com os mesmos nomes da OKX Assets
     d, err = okx_get("/api/v5/account/balance")
     if err: return None, err + " | Chave Demo para TESTE, Real para REAL? Passphrase? Read+Trade?"
     est_total=0.0; usdt_equity=0.0; usdt_available=0.0; usdt_upl=0.0
     for acc in d.get("data",[]):
-        # totalEq da conta = Est total value USD (todas as moedas)
         try: est_total+=float(acc.get("totalEq") or 0)
         except: pass
         for c in acc.get("details",[]):
@@ -170,7 +172,6 @@ def okx_balance():
                 except: pass
                 try: usdt_upl+=float(c.get("upl") or 0)
                 except: pass
-    # Se totalEq vier 0, soma eqUsd de cada moeda
     if est_total<=0:
         for acc in d.get("data",[]):
             for c in acc.get("details",[]):
@@ -184,7 +185,6 @@ def okx_balance():
             if c.get("ccy")=="USDT":
                 try: funding+=float(c.get("bal") or 0)
                 except: pass
-    # Guarda tudo separado, sem misturar
     state["est_total_usd"]=round(est_total,4)
     state["saldo_trading"]=round(usdt_equity,4)
     state["usdt_equity"]=round(usdt_equity,4)
@@ -194,7 +194,6 @@ def okx_balance():
     state["saldo_funding"]=round(funding,4)
     state["reserva_okx"]=round(usdt_available,4)
     state["reserva"]=round(usdt_available,4)
-    # Conta = Est total value USD (numero grande da OKX Assets). Cofre Global = mesmo numero.
     state["saldo_conta"]=round(est_total,4)
     state["cofre_global"]=round(est_total,4)
     state["fonte_saldo"]=f"OKX {'Demo' if is_teste() else 'Real'} - Est total {est_total:.2f} USD | USDT Equity {usdt_equity:.2f} | Available {usdt_available:.2f} | In use {usdt_in_use:.2f} | UPL {usdt_upl:.2f} | Funding USDT {funding:.2f} (separado)"
@@ -225,7 +224,6 @@ def sync_saldo_real():
             state["erro_bybit"]=""
             if not state.get("running"):
                 state["saldo_conta_inicio"]=real
-            # Nunca faz Reserva = Conta - Operacao Virtual. Reserva = Available OKX, ja posto em okx_balance.
             return True
         else:
             state["chaves"]=f"ERRO A LER OKX - Nao opera sem leitura"; state["erro_bybit"]=err or ""; return False
@@ -252,6 +250,39 @@ def okx_get_fills(ord_id=None):
     d, err = okx_get(path)
     if err: return None, err
     return d.get("data",[]), None
+def okx_get_positions():
+    # FALHA B: Posicoes reais da OKX sao a verdade
+    cfg,_ = moeda_cfg()
+    d, err = okx_get(f"/api/v5/account/positions?instType=SWAP&instId={cfg['inst_okx']}")
+    if err: return [], err
+    out=[]
+    for p in d.get("data",[]):
+        try:
+            pos=float(p.get("pos") or 0)
+            if pos==0: continue
+            out.append({"lado":"LONG" if p.get("posSide")=="long" else "SHORT","pos_contratos":pos,"entry":float(p.get("avgPx") or 0),"upl":float(p.get("upl") or 0),"margin":float(p.get("margin") or 0),"lever":p.get("lever"),"pos_side":p.get("posSide")})
+        except: pass
+    return out, None
+def okx_cancel_order(ord_id):
+    # FALHA A: Cancela limite antiga quando PENDING mexe
+    if not ord_id: return True, None
+    cfg,_ = moeda_cfg()
+    d, err = okx_post("/api/v5/trade/cancel-order", {"instId":cfg["inst_okx"],"ordId":str(ord_id)})
+    if err:
+        # Se ja foi preenchida / cancelada, nao e erro fatal - ignora
+        if "51603" in err or "not exist" in err.lower() or "cancelled" in err.lower():
+            return True, None
+        return False, err
+    return True, None
+def okx_cancel_all_open():
+    cfg,_ = moeda_cfg()
+    d, err = okx_post("/api/v5/trade/cancel-batch-orders", [])
+    # Fallback: cancela 1 a 1 pelas PENDING do bot
+    for o in list(state["orders"]):
+        if o.get("tipo")=="PENDING" and o.get("okx_ord_id"):
+            okx_cancel_order(o.get("okx_ord_id"))
+            o["okx_ord_id"]=None
+    return True
 def okx_place_limit(lado, ref_price):
     cfg,_ = moeda_cfg()
     sz_str, sz_f, lote = calc_sz(ref_price)
@@ -262,6 +293,23 @@ def okx_place_limit(lado, ref_price):
     try: oid=d["data"][0]["ordId"]
     except: oid=""
     return oid, None, sz_str
+def okx_move_pending(o, novo_ref):
+    # FALHA A: Move PENDING = Cancela antiga + Cria nova. Nunca deixa 2 limites na OKX para 1 PENDING.
+    if executar_okx() and o.get("okx_ord_id"):
+        ok, err = okx_cancel_order(o.get("okx_ord_id"))
+        if not ok:
+            state["erro_bybit"]=f"Falha a cancelar limite antiga {o['lado']} {o['ref']} ord {o.get('okx_ord_id')}: {err} - nao move, espera."
+            return False
+        o["okx_ord_id"]=None
+    passo=state["settings"]["passo"] or 15
+    o["ref"]=novo_ref; o["entrada"]=novo_ref; o["alvo"]=round(novo_ref+passo,1) if o["lado"]=="LONG" else round(novo_ref-passo,1)
+    if executar_okx() and not state.get("encerramento"):
+        oid, err, sz_str = okx_place_limit(o["lado"], novo_ref)
+        if err:
+            state["erro_bybit"]=f"Falha a criar nova limite {o['lado']} {novo_ref}: {err} - PENDING sem ordem na OKX, tenta de novo."
+            return False
+        o["okx_ord_id"]=oid; o["sz"]=sz_str
+    return True
 def okx_close_market_once(o, price):
     if o.get("closing"):
         return None, "JA A FECHAR - anti-duplicado, a aguardar confirmacao OKX"
@@ -269,6 +317,14 @@ def okx_close_market_once(o, price):
     sz_str = o.get("sz")
     if not sz_str:
         sz_str, _, _ = calc_sz(price or 60000)
+    # Se OKX tem posicao maior que o bot, fecha a posicao real da OKX, nao so o Sz do bot
+    if executar_okx():
+        pos_list, _ = okx_get_positions()
+        for p in pos_list:
+            if p["lado"]==o["lado"]:
+                # Fecha tudo o que a OKX tem desse lado, para nao deixar resto
+                sz_str = fmt_sz(p["pos_contratos"], okx_lote()["lotSz"])
+                break
     o["closing"]=True; o["closing_em"]=now()
     side="sell" if o["lado"]=="LONG" else "buy"
     payload={"instId":cfg["inst_okx"],"tdMode":"cross","side":side,"posSide":"long" if o["lado"]=="LONG" else "short","ordType":"market","sz":str(sz_str)}
@@ -301,7 +357,7 @@ def okx_close_market_once(o, price):
     return {"fill_px":fill_px,"fee":fee,"pnl_real":pnl_real,"ord_id":oid}, None
 def mk_order(lado, ref, passo, origem):
     alvo=round(ref+passo,1) if lado=="LONG" else round(ref-passo,1)
-    return {"id":f"{lado[0]}{int(time.time()*1000)%1000000}{len(state['orders'])}","lado":lado,"tipo":"PENDING","ref":round(ref,1),"entrada":round(ref,1),"alvo":alvo,"pnl":0.0,"falta_pts":0.0,"trava":"","flutuante":True,"congelada":False,"origem":origem,"best":None,"armado":False,"armado_em":None,"passou_alvo":False,"ativar_em":None,"preco_fill":None,"okx_ord_id":None,"sz":None,"closing":False,"closing_em":None,"close_ord_id":None}
+    return {"id":f"{lado[0]}{int(time.time()*1000)%1000000}{len(state['orders'])}","lado":lado,"tipo":"PENDING","ref":round(ref,1),"entrada":round(ref,1),"alvo":alvo,"pnl":0.0,"falta_pts":0.0,"trava":"","flutuante":True,"congelada":False,"origem":origem,"best":None,"armado":False,"armado_em":None,"passou_alvo":False,"ativar_em":None,"preco_fill":None,"okx_ord_id":None,"sz":None,"closing":False,"closing_em":None,"close_ord_id":None,"espelho_okx":False}
 def build_grid(price, passo):
     orders=[]
     for i in range(10):
@@ -329,7 +385,11 @@ def add_order_keep_cap(new_o):
     if len(state["orders"])>=total_max():
         pend=[x for x in state["orders"] if x["tipo"]=="PENDING"]
         if pend:
-            far=max(pend, key=lambda x: abs(x["ref"]-state["price"])); state["orders"].remove(far)
+            far=max(pend, key=lambda x: abs(x["ref"]-state["price"]))
+            # FALHA A: Ao descartar PENDING, cancela limite na OKX
+            if executar_okx() and far.get("okx_ord_id"):
+                okx_cancel_order(far.get("okx_ord_id"))
+            state["orders"].remove(far)
         else: return False
     state["orders"].append(new_o); return True
 def estimar_pnl(o, exit_price):
@@ -416,6 +476,29 @@ def try_rescue_close(price):
     custo_total = round(custo + TAXA_FECHO_EST,4)
     if state.get("cofre_resgate",0) >= custo_total and custo>0:
         close_resgate(mais_antiga, price)
+def sync_positions_okx(price, passo):
+    # FALHA B: Le posicoes reais OKX e espelha no bot. Se OKX tem posicao que bot nao tem, cria ACTIVE espelho.
+    if not executar_okx(): return
+    pos_list, err = okx_get_positions()
+    if err: return
+    if not pos_list:
+        state["pos_okx"]="OKX: sem posicoes abertas"
+        return
+    txt=[]
+    for p in pos_list:
+        txt.append(f"{p['lado']} OKX: {p['pos_contratos']} contratos | Entry {p['entry']} | UPL {p['upl']:.4f} | Margin {p['margin']:.2f}")
+        # Procura ACTIVE do mesmo lado
+        ativos=[x for x in state["orders"] if x["tipo"]=="ACTIVE" and x["lado"]==p["lado"]]
+        if not ativos:
+            # Cria espelho - nao inventa, usa Entry e Size reais da OKX
+            o=mk_order(p["lado"], p["entry"], passo, "ESPELHO-OKX")
+            o["tipo"]="ACTIVE"; o["preco_fill"]=p["entry"]; o["best"]=p["entry"]; o["sz"]=fmt_sz(p["pos_contratos"], okx_lote()["lotSz"]); o["pnl"]=round(p["upl"],4); o["espelho_okx"]=True; o["trava"]="ESPELHO OKX - posicao real"
+            state["orders"].append(o)
+        else:
+            # Atualiza ACTIVE existente com Size e PnL reais da OKX
+            for a in ativos:
+                a["sz"]=fmt_sz(p["pos_contratos"], okx_lote()["lotSz"]); a["pnl"]=round(p["upl"],4); a["espelho_okx"]=True
+    state["pos_okx"]=" | ".join(txt)
 def bot_loop():
     while True:
         try:
@@ -424,6 +507,8 @@ def bot_loop():
             state["ref"]=p
             if state["running"] and state["price"]>0:
                 price=state["price"]; passo=state["settings"]["passo"] or 15; orders=state["orders"]
+                # FALHA B: Sincroniza posicoes reais antes de decidir
+                sync_positions_okx(price, passo)
                 seen=set(); uniq=[]
                 for o in orders:
                     k=(o["lado"],o["ref"],o["tipo"])
@@ -440,14 +525,23 @@ def bot_loop():
                         if dist <= passo*0.5 and dist>=-passo: o["congelada"]=True
                         else: o["congelada"]=False
                         if abs(o["ref"]-price)>50: o["congelada"]=False
+                # REGRAS DO COMECO - FLUTUANTE: PENDING segue preco a 1 passo, com cancelamento da antiga na OKX
                 longs_sorted=sorted([x for x in orders if x["lado"]=="LONG" and x["tipo"]=="PENDING" and not x.get("congelada")], key=lambda x: x["ref"])
                 for idx, o in enumerate(longs_sorted):
                     novo=round(price+(idx+1)*passo,1)
-                    o["ref"]=novo; o["entrada"]=novo; o["alvo"]=round(novo+passo,1)
+                    if abs(novo-o["ref"])>0.1:
+                        if executar_okx():
+                            okx_move_pending(o, novo)
+                        else:
+                            o["ref"]=novo; o["entrada"]=novo; o["alvo"]=round(novo+passo,1)
                 shorts_sorted=sorted([x for x in orders if x["lado"]=="SHORT" and x["tipo"]=="PENDING" and not x.get("congelada")], key=lambda x: x["ref"], reverse=True)
                 for idx, o in enumerate(shorts_sorted):
                     novo=round(price-(idx+1)*passo,1)
-                    o["ref"]=novo; o["entrada"]=novo; o["alvo"]=round(novo-passo,1)
+                    if abs(novo-o["ref"])>0.1:
+                        if executar_okx():
+                            okx_move_pending(o, novo)
+                        else:
+                            o["ref"]=novo; o["entrada"]=novo; o["alvo"]=round(novo-passo,1)
                 for o in list(orders):
                     if o["tipo"]=="PENDING":
                         if state.get("encerramento"): continue
@@ -458,37 +552,50 @@ def bot_loop():
                                 continue
                             if saldo_livre()>=mn:
                                 if executar_okx():
-                                    oid, err, sz_str = okx_place_limit(o["lado"], o["ref"])
-                                    if err:
-                                        state["erro_bybit"]=f"Falha a abrir na OKX ({o['lado']} {o['ref']} Sz {sz_str}): {err} - fica PENDING, tenta de novo."
-                                        continue
-                                    o["okx_ord_id"]=oid; o["sz"]=sz_str
+                                    # Se PENDING ja tem limite na OKX, essa limite e a ativacao. Nao cria outra.
+                                    # Marca como ACTIVE quando preco toca, a limite da OKX executa sozinha.
                                     o["tipo"]="ACTIVE"; o["preco_fill"]=o["ref"]; o["best"]=o["ref"]; o["armado"]=False; o["armado_em"]=None; o["ativar_em"]=None
+                                    # Sz vem da limite ja criada
+                                    if not o.get("sz"):
+                                        s_str,_,_=calc_sz(o["ref"]); o["sz"]=s_str
                                 else:
                                     slip=random.uniform(0.5,1); fill=round(price+slip,1) if o["lado"]=="LONG" else round(price-slip,1)
                                     o["tipo"]="ACTIVE"; o["preco_fill"]=fill; o["best"]=fill; o["armado"]=False; o["armado_em"]=None; o["ativar_em"]=None; s_str,_,_=calc_sz(fill); o["sz"]=s_str
-                                if not state.get("encerramento"): add_order_keep_cap(mk_order(o["lado"], round(price+passo,1) if o["lado"]=="LONG" else round(price-passo,1), passo, "FLUT-REPOSICAO"))
+                                if not state.get("encerramento"):
+                                    novo_pend=mk_order(o["lado"], round(price+passo,1) if o["lado"]=="LONG" else round(price-passo,1), passo, "FLUT-REPOSICAO")
+                                    if add_order_keep_cap(novo_pend):
+                                        # Cria limite na OKX para a reposicao
+                                        if executar_okx():
+                                            oid, err, sz_str = okx_place_limit(novo_pend["lado"], novo_pend["ref"])
+                                            if not err:
+                                                novo_pend["okx_ord_id"]=oid; novo_pend["sz"]=sz_str
                         elif not toca: o["pnl"]=0.0; o["falta_pts"]=0.0; o["trava"]=""
                 for o in list(orders):
                     if o["tipo"]=="ACTIVE":
                         if o.get("closing"):
                             o["trava"]="A FECHAR - A AGUARDAR OKX - NAO MANDA OUTRA VEZ"
                             continue
-                        mov=(price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-price)
-                        o["falta_pts"]=round(abs(mov),1) if mov<0 else round(max(0, passo-mov),1)
-                        if executar_okx():
-                            try: sz_f=float(o.get("sz") or 0)
-                            except: sz_f=0
-                            lote=okx_lote(); o["pnl"]=round(mov*sz_f*lote["ctVal"],4)
-                        else: o["pnl"]=round(mov*0.0015,4)
-                        if mov>0:
+                        # Se espelho OKX, PnL ja vem da OKX, nao recalcula por estimativa
+                        if not o.get("espelho_okx"):
+                            mov=(price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-price)
+                            o["falta_pts"]=round(abs(mov),1) if mov<0 else round(max(0, passo-mov),1)
+                            if executar_okx():
+                                try: sz_f=float(o.get("sz") or 0)
+                                except: sz_f=0
+                                lote=okx_lote(); o["pnl"]=round(mov*sz_f*lote["ctVal"],4)
+                            else: o["pnl"]=round(mov*0.0015,4)
+                        else:
+                            mov=(price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-price)
+                            o["falta_pts"]=round(abs(mov),1) if mov<0 else round(max(0, passo-mov),1)
+                        if o.get("pnl",0)>0:
+                            mov2=(price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-price)
                             if o.get("best") is None: o["best"]=price
                             else:
                                 if o["lado"]=="LONG": o["best"]=max(o["best"],price)
                                 else: o["best"]=min(o["best"],price)
                             passou=(price>=o["alvo"]) if o["lado"]=="LONG" else (price<=o["alvo"])
                             if passou: o["passou_alvo"]=True
-                            if mov/passo>=0.40 and not o.get("armado"): o["armado"]=True; o["armado_em"]=price; o["trava"]="TRAVA ARMADA 40%"
+                            if mov2/passo>=0.40 and not o.get("armado"): o["armado"]=True; o["armado_em"]=price; o["trava"]="TRAVA ARMADA 40%"
                             elif o.get("armado"): o["trava"]="TRAVA ARMADA 40%"
                             if o.get("armado") and o.get("best") is not None:
                                 recuo=abs(price-o["best"]); limite=0.20*passo
@@ -520,7 +627,10 @@ def bot_loop():
                                     break
                 if len(state["orders"])>total_max():
                     pend=sorted([x for x in state["orders"] if x["tipo"]=="PENDING"],key=lambda x: abs(x["ref"]-price),reverse=True)
-                    for extra in pend[:len(state["orders"])-total_max()]: state["orders"].remove(extra)
+                    for extra in pend[:len(state["orders"])-total_max()]:
+                        if executar_okx() and extra.get("okx_ord_id"):
+                            okx_cancel_order(extra.get("okx_ord_id"))
+                        state["orders"].remove(extra)
                 state["em_uso"]=round(len([x for x in state["orders"] if x["tipo"]=="ACTIVE"])*margem_necessaria(),4); save(state)
         except Exception as e: print("loop",e)
         time.sleep(1.0)
@@ -529,13 +639,13 @@ HTML='''
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ND-SCALPING</title><style>
 *{box-sizing:border-box}body{margin:0;background:#0f1115;color:#fff;font-family:Arial,sans-serif;padding-bottom:90px}.top{background:#1a1d24;padding:10px 12px;position:sticky;top:0}.top b{color:#2ecc71;font-size:22px}.papel{color:#ff8c00;font-weight:bold}.teste{color:#3498db;font-weight:bold}.real{color:#e74c3c;font-weight:bold}.small{color:#aaa;font-size:12px}.card{background:#1a1d24;margin:10px;border-radius:10px;padding:12px}.green{color:#2ecc71}.red{color:#e74c3c}.big{font-size:26px;font-weight:bold}.grid{display:flex;gap:8px}.box{flex:1;border-radius:8px;padding:8px}.short{background:#3a1414}.long{background:#12331f}.refbar{background:#f1c40f;color:#000;text-align:center;padding:6px;border-radius:6px;font-weight:bold;margin:8px 0}.ord{border-bottom:1px solid #333;padding:6px 0;font-size:13px}.btn{width:100%;padding:14px;border:0;border-radius:8px;font-weight:bold;font-size:16px;cursor:pointer}.btn-start{background:#2ecc71;color:#fff}.btn-stop{background:#e74c3c;color:#fff}.btn-save{background:#3498db;color:#fff;padding:12px}.inp{width:100%;padding:10px;border-radius:6px;border:1px solid #333;background:#0f1115;color:#fff;margin:4px 0 10px}label{font-size:13px;color:#ddd}.tabs{position:fixed;bottom:0;left:0;right:0;display:flex;background:#1a1d24;border-top:1px solid #333}.tabs button{flex:1;padding:14px;background:none;border:0;color:#aaa;font-weight:bold}.tabs button.on{color:#2ecc71}.hidden{display:none}.trava{color:#f1c40f;font-size:11px}.histline{border-bottom:1px solid #333;padding:6px 0;font-size:13px}.enc{background:#f1c40f;color:#000;padding:6px;border-radius:6px;font-weight:bold;text-align:center;margin-top:6px}.chaves{padding:6px;border-radius:6px;font-weight:bold;margin-top:6px;background:#12331f}.erro{color:#e74c3c;font-size:12px}.exec{background:#3498db;color:#fff;padding:6px;border-radius:6px;font-weight:bold;margin-top:6px;text-align:center}
 </style></head><body>
-<div class="top"><b>ND-SCALPING</b> <span id="topConta" class="papel">PAPEL</span> <span id="topCorr" class="small"></span><div class="small">Atualizado: <span id="upd">--</span> | Fonte: <span id="fonte">--</span> | Taxa 0.055% | Slippage 0.5-1 | Trava 40% / Recuo 20% | FLUTUANTE | SALDO CERTO</div></div>
+<div class="top"><b>ND-SCALPING</b> <span id="topConta" class="papel">PAPEL</span> <span id="topCorr" class="small"></span><div class="small">Atualizado: <span id="upd">--</span> | Fonte: <span id="fonte">--</span> | Taxa 0.055% | Slippage 0.5-1 | Trava 40% / Recuo 20% | FLUTUANTE | REGRAS DO COMECO</div></div>
 <div id="tab-dash">
-<div class="card"><b>STATUS - ANALISE <span id="corrNome"></span></b><div id="status"></div><div id="execBox"></div><div id="encBox"></div><div id="chavesBox"></div><div id="erroBox"></div><div id="loteBox"></div>
-<div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap"><div><div class="small">CONTA OKX - Est total value USD (igual OKX Assets)</div><div class="big" id="saldoConta">--</div><div class="small">USDT Equity: <span id="usdtEq"></span> | Available: <span id="usdtAv"></span> | In use: <span id="usdtUse"></span> | UPL: <span id="usdtUpl"></span> | Funding USDT: <span id="fundTxt"></span></div></div><div><div class="small">OPERACAO - BALDE VIRTUAL (separado, nao subtrai da conta real)</div><div class="big" id="saldoOp">--</div></div><div><div class="small">RESERVA OKX = USDT Available (igual OKX)</div><div class="big" id="reserva">--</div></div></div>
+<div class="card"><b>STATUS - ANALISE <span id="corrNome"></span></b><div id="status"></div><div id="execBox"></div><div id="encBox"></div><div id="chavesBox"></div><div id="erroBox"></div><div id="loteBox"></div><div id="posOkxBox"></div>
+<div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap"><div><div class="small">CONTA OKX - Est total value USD (igual OKX Assets)</div><div class="big" id="saldoConta">--</div><div class="small">USDT Equity: <span id="usdtEq"></span> | Available: <span id="usdtAv"></span> | In use: <span id="usdtUse"></span> | UPL: <span id="usdtUpl"></span> | Funding USDT: <span id="fundTxt"></span></div></div><div><div class="small">OPERACAO - BALDE VIRTUAL (separado)</div><div class="big" id="saldoOp">--</div></div><div><div class="small">RESERVA OKX = USDT Available</div><div class="big" id="reserva">--</div></div></div>
 <div class="small">Conta = Est total USD | Operacao = Inicio +/- PnL | Cofre Op = <span id="cofreOp"></span> | Cofre Resgate = <span id="cofreResg"></span> | Cofre Global = Est total USD = <span id="cofreG"></span> | Margem necess. = <span id="margNec"></span> | Alvo = <span id="alvoTxt"></span> | Fonte Saldo: <span id="fonteSaldo"></span> | Passo sug. <span id="passoSug"></span> | Negativas: <span id="negTxt"></span> | Alav OKX: <span id="alavTxt"></span></div></div>
-<div class="card"><b>POSICAO ATUAL - AO VIVO</b><div id="pos"></div><button id="mainBtn" class="btn btn-start" onclick="toggle()">INICIAR BOT</button><div class="small">TESTE = Demo OKX Futures BTC-USDT-SWAP. REAL = Real OKX Futures. PAPEL = nao manda nada. Ver ordens em Trade > Futures, nao em Spot. FLUTUANTE: PENDING segue o preco a 1 passo. SALDO CERTO: Conta = Est total USD da OKX, Reserva = Available USDT da OKX, Operacao virtual separada.</div></div>
-<div class="card"><b>GRID FLUTUANTE — REF = PRECO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">PENDING flutuante: segue preco a 1 passo, so congela quando preco vem para ativar. Trava 40%. Recuo 20%. Max 2 negativas total, max 1 por lado. Trava nao fecha negativo.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
+<div class="card"><b>POSICAO ATUAL - AO VIVO</b><div id="pos"></div><button id="mainBtn" class="btn btn-start" onclick="toggle()">INICIAR BOT</button><div class="small">TESTE = Demo OKX Futures BTC-USDT-SWAP. REAL = Real OKX Futures. PAPEL = nao manda nada. REGRAS DO COMECO: Pinca Flutuante, Trava 40%/20%, Resgate, Max 2 negativas. FALHAS CORRIGIDAS: PENDING mexe = cancela limite antiga na OKX. Posicoes OKX sao a verdade.</div></div>
+<div class="card"><b>GRID FLUTUANTE — REF = PRECO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">PENDING flutuante: segue preco a 1 passo, so congela quando preco vem para ativar. Trava 40%. Recuo 20%. Max 2 negativas total, max 1 por lado. Trava nao fecha negativo. 1 PENDING = 1 limite na OKX.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
 </div>
 <div id="tab-merc" class="hidden"><div class="card"><b>MERCADO - GRAFICO</b><div id="merc"></div><div style="position:relative;height:160px;background:#0a2a4a;border-radius:8px;overflow:hidden;margin:8px 0"><div id="priceLine" style="position:absolute;left:0;right:0;height:2px;background:#fff"></div><div id="refLine" style="position:absolute;left:0;right:0;height:2px;background:#f1c40f"></div><div id="ordDots"></div><div id="priceLabel" style="position:absolute;right:6px;background:#fff;color:#000;padding:2px 6px;border-radius:4px;font-size:12px;font-weight:bold"></div></div><div class="small">Linha branca = Preço | Linha amarela = Ref | Verde = LONG | Vermelho = SHORT | Trajetoria: <span id="traj"></span></div><div><b>ORDENS ABERTAS</b><div id="contagem"></div></div></div></div>
 <div id="tab-hist" class="hidden"><div class="card"><b>HISTORICO - PnL REAL OKX</b><div><label>ESCOLHE O DIA</label><input class="inp" type="date" id="dia"></div><div id="histResumo"></div><div id="hist"></div></div></div>
@@ -547,18 +657,18 @@ HTML='''
 <label>SALDO DA OPERACAO (USDT) - Balde virtual, separado da conta real</label><input class="inp" id="f_saldo_op">
 <label>MARGEM POR ORDEM</label><input class="inp" id="f_margem">
 <label>ALAVANCAGEM (1 A 20) - Vai ser mandada para a OKX</label><input class="inp" id="f_alav">
-<label>ESPACAMENTO GRID - PASSO - SOLUCAO BTC 15, ETH 3, SOL 1, XRP 0.02, DOGE 0.003</label><input class="inp" id="f_passo">
+<label>ESPACAMENTO GRID - PASSO - REGRAS DO COMECO BTC 15, ETH 3, SOL 1, XRP 0.02, DOGE 0.003</label><input class="inp" id="f_passo">
 <label>NUMERO TOTAL DE ORDENS</label><input class="inp" id="f_total">
 <label>LUCRO POR OPERACAO (USDT)</label><input class="inp" id="f_lucro">
 <label>MODO</label><select class="inp" id="f_modo"><option value="Manual">Manual</option><option value="Automatico">Automatico</option></select>
 <label>OPERACOES POR DIA - AUTOMATICO: ALVO = LUCRO X OPERACOES</label><input class="inp" id="f_ops">
-<button class="btn btn-save" onclick="salvar()">GUARDAR</button><div class="small">OKX: TESTE = chaves Demo. REAL = chaves Reais. Read + Trade, sem Withdraw. Saldo lido da OKX: Est total USD, USDT Equity, Available, In use. Reserva = Available. Operacao virtual separada.</div></div></div>
+<button class="btn btn-save" onclick="salvar()">GUARDAR</button><div class="small">OKX: TESTE = chaves Demo. REAL = chaves Reais. Read + Trade, sem Withdraw. Regras do comeco: Pinca Flutuante, Trava 40%/20%, Resgate, Max 2 negativas.</div></div></div>
 <div class="tabs"><button onclick="tab('dash',this)" class="on">Dashboard</button><button onclick="tab('merc',this)">Mercado</button><button onclick="tab('hist',this)">Historico</button><button onclick="tab('aj',this)">Ajustes</button></div>
 <script>
 let S={}; let ajPreenchido=false;
 function tab(n,el){['dash','merc','hist','aj'].forEach(x=>document.getElementById('tab-'+x).classList.toggle('hidden',x!==n));document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));el.classList.add('on')}
 function faltaTxt(o){if(o.tipo!=='ACTIVE') return `Falta ${(o.falta_pts||0).toFixed(1)} pontos para o alvo ${o.congelada?'• CONGELADA - PRECO A VIR': '• FLUTUANTE'}`; if(o.pnl<0) return `Falta ${(o.falta_pts||0).toFixed(1)} pontos para voltar a 0 - RESGATE`; return `Falta ${(o.falta_pts||0).toFixed(1)} pontos para o alvo ${o.passou_alvo?'• PASSOU ALVO - INFINITO':''}`}
-async function load(){let r=await fetch('/api/state');S=await r.json();document.getElementById('upd').textContent=S.last_update;document.getElementById('fonte').textContent=S.fonte;let tc=document.getElementById('topConta');tc.textContent=S.settings.conta;tc.className=S.settings.conta==='REAL'?'real':(S.settings.conta==='TESTE'?'teste':'papel');document.getElementById('topCorr').textContent=S.settings.corretora+' • '+S.settings.moeda+'/USDT • '+S.settings.modo;document.getElementById('corrNome').textContent=S.settings.corretora+' • '+S.settings.moeda;let st=document.getElementById('saldoConta');st.textContent=S.saldo_conta.toFixed(4);st.className='big '+(S.saldo_conta>=0?'green':'red');document.getElementById('usdtEq').textContent=S.usdt_equity.toFixed(2);document.getElementById('usdtAv').textContent=S.usdt_available.toFixed(2);document.getElementById('usdtUse').textContent=S.usdt_in_use.toFixed(2);document.getElementById('usdtUpl').textContent=S.usdt_upl.toFixed(2);document.getElementById('fundTxt').textContent=S.saldo_funding.toFixed(2);let so=document.getElementById('saldoOp');so.textContent=S.saldo_op.toFixed(4);so.className='big '+(S.saldo_op>=0?'green':'red');let rv=document.getElementById('reserva');rv.textContent=S.reserva.toFixed(4);rv.className='big '+(S.reserva>=0?'green':'red');document.getElementById('cofreOp').textContent=(S.cofre_op>=0?'+':'')+S.cofre_op.toFixed(4);document.getElementById('cofreResg').textContent=S.cofre_resgate.toFixed(4);document.getElementById('cofreG').textContent=S.cofre_global.toFixed(4);document.getElementById('margNec').textContent=S.margem_necessaria.toFixed(4)+' USDT';document.getElementById('alvoTxt').textContent=S.alvo_total.toFixed(4)+' USDT ('+S.settings.modo+')';document.getElementById('fonteSaldo').textContent=S.fonte_saldo;document.getElementById('passoSug').textContent=S.passo_sug;document.getElementById('negTxt').textContent=S.negativas+' negativas (max 2 total, max 1/lado)';document.getElementById('alavTxt').textContent=S.alav_okx||'--';document.getElementById('execBox').innerHTML=`<div class="exec">${S.execucao}</div>`;document.getElementById('loteBox').innerHTML=`<div class="small" style="color:#f1c40f">LOTE OKX: ${S.lote_info} | Sz exemplo: ${S.sz_exemplo||''} contratos | SALDO CERTO - Est total + USDT Equity + Available + In use</div>`;document.getElementById('chavesBox').innerHTML=`<div class="chaves">CORRETORA: ${S.settings.corretora} | CONTA: ${S.settings.conta} | MOEDA: ${S.settings.moeda} | CHAVES: ${S.chaves} | Est total: ${S.est_total_usd} | USDT Equity: ${S.usdt_equity} | Available: ${S.usdt_available} | In use: ${S.usdt_in_use} | Funding: ${S.saldo_funding} | Alav OKX: ${S.alav_okx}</div>`;document.getElementById('erroBox').innerHTML=S.erro_bybit?`<div class="erro">ERRO OKX: ${S.erro_bybit}</div>`:'';document.getElementById('encBox').innerHTML=S.encerramento?'<div class="enc">ENCERRAMENTO - Atingiu o alvo '+S.alvo_total+'. Parou de abrir novas.</div>':'';let pnlTot=S.saldo_op - S.saldo_op_inicio;document.getElementById('status').innerHTML=`<div class="${S.running?'green':'red'}">${S.running?'A OPERAR - FLUTUANTE':'PARADO'}</div><div class="small">Par: ${S.settings.moeda}/USDT | Preco: ${S.price} | Ref: ${S.ref} (= Preco) | Modo: ${S.settings.conta} | Futures ${S.settings.moeda}-USDT-SWAP</div><div style="background:#12331f;padding:6px;border-radius:6px;margin-top:6px">GRID FLUTUANTE - Total ${S.orders.length} / ${S.settings.total_ordens} | Negativas: ${S.negativas} / 2 max</div>`;document.getElementById('pos').innerHTML=`<div>Preco: ${S.price} | Ref: ${S.ref}</div><div class="big ${pnlTot>=0?'green':'red'}">${pnlTot>=0?'+':''}${pnlTot.toFixed(4)} USDT — P&L total operacao virtual</div><div class="small">P&L vivo ACTIVE: ${S.pnl.toFixed(4)} | Cofre Op: ${S.cofre_op.toFixed(4)} | Cofre Resgate: ${S.cofre_resgate.toFixed(4)} | Cofre Global = Est total: ${S.cofre_global.toFixed(4)} | PnL acumulado: ${S.pnl_acumulado}</div><div>Saldo Op virtual: ${S.saldo_op} | Em uso virtual: ${S.em_uso} | Livre virtual: ${(S.saldo_op - S.em_uso).toFixed(4)} | Margem necess.: ${S.margem_necessaria} | Sz por ordem: ${S.sz_exemplo||''} contratos</div>`;document.getElementById('refbar').textContent=`Ref: ${S.ref} • Preço: ${S.price} (Ref = Preco)`;document.getElementById('merc').innerHTML=`Preco: ${S.price} | Ref: ${S.ref} | Moeda: ${S.settings.moeda}`;document.getElementById('traj').textContent=S.trajetoria;document.getElementById('contagem').textContent=`${S.orders.length} / ${S.settings.total_ordens} | ${S.orders.filter(o=>o.tipo==='ACTIVE').length} ACTIVE | ${S.orders.filter(o=>o.tipo==='PENDING').length} PENDING`;let sh=S.orders.filter(o=>o.lado==='SHORT').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.okx_ord_id? '• OKX '+o.okx_ord_id.slice(0,8):''} ${o.closing? '• A FECHAR - NAO MANDA OUTRA VEZ':''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)} • Sz ${o.sz||''}<br>${faltaTxt(o)}</div>`).join('')||'—';let lo=S.orders.filter(o=>o.lado==='LONG').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.okx_ord_id? '• OKX '+o.okx_ord_id.slice(0,8):''} ${o.closing? '• A FECHAR - NAO MANDA OUTRA VEZ':''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)} • Sz ${o.sz||''}<br>${faltaTxt(o)}</div>`).join('')||'—';document.getElementById('shorts').innerHTML=sh;document.getElementById('longs').innerHTML=lo;let btn=document.getElementById('mainBtn');btn.textContent=S.running?'PARAR ROBÔ':'INICIAR BOT';btn.className='btn '+(S.running?'btn-stop':'btn-start');let tot=S.pnl_acumulado;document.getElementById('histResumo').innerHTML=`<div class="big ${tot>=0?'green':'red'}">${tot>=0?'+':''}${tot.toFixed(4)} USDT — total</div><div class="small">LONG: ${S.pnl_long.toFixed(4)} + SHORT: ${S.pnl_short.toFixed(4)} = ${tot.toFixed(4)}</div>`;document.getElementById('hist').innerHTML=S.history.map(x=>`<div class="histline">${x.lado} GRID-FLUT | ${x.hora} | ${x.pnl>=0?'+':''}${x.pnl} USDT<br>${x.entrada} → ${x.saida} • ${x.motivo}</div>`).join('');let refs=S.orders.length?S.orders.map(o=>o.ref):[S.ref];let mn=Math.min(...refs,S.price)-50;let mx=Math.max(...refs,S.price)+50;let posP=(1-(S.price-mn)/(mx-mn))*100;let posR=(1-(S.ref-mn)/(mx-mn))*100;let pl=document.getElementById('priceLine');pl.style.top=posP+'%';let rl=document.getElementById('refLine');rl.style.top=posR+'%';let lbl=document.getElementById('priceLabel');lbl.style.top=(posP-8)+'px';lbl.textContent=S.price;let dots=S.orders.filter(o=>o.tipo==='ACTIVE').map(o=>{let y=(1-(o.ref-mn)/(mx-mn))*100;let c=o.lado==='LONG'?'#2ecc71':'#e74c3c';return `<div style="position:absolute;left:${o.lado==='LONG'?'20%':'70%'};top:${y}%;width:10px;height:10px;border-radius:50%;background:${c}"></div>`}).join('');document.getElementById('ordDots').innerHTML=dots;if(!ajPreenchido){ajPreenchido=true;document.getElementById('f_corretora').value=S.settings.corretora;document.getElementById('f_conta_tipo').value=S.settings.conta;document.getElementById('f_moeda').value=S.settings.moeda;document.getElementById('f_conta').value=S.settings.saldo_conta;document.getElementById('f_saldo_op').value=S.settings.saldo_op;document.getElementById('f_margem').value=S.settings.margem;document.getElementById('f_alav').value=S.settings.alav;document.getElementById('f_passo').value=S.settings.passo;document.getElementById('f_total').value=S.settings.total_ordens;document.getElementById('f_lucro').value=S.settings.lucro_op;document.getElementById('f_modo').value=S.settings.modo;document.getElementById('f_ops').value=S.settings.ops_dia;}}
+async function load(){let r=await fetch('/api/state');S=await r.json();document.getElementById('upd').textContent=S.last_update;document.getElementById('fonte').textContent=S.fonte;let tc=document.getElementById('topConta');tc.textContent=S.settings.conta;tc.className=S.settings.conta==='REAL'?'real':(S.settings.conta==='TESTE'?'teste':'papel');document.getElementById('topCorr').textContent=S.settings.corretora+' • '+S.settings.moeda+'/USDT • '+S.settings.modo;document.getElementById('corrNome').textContent=S.settings.corretora+' • '+S.settings.moeda;let st=document.getElementById('saldoConta');st.textContent=S.saldo_conta.toFixed(4);st.className='big '+(S.saldo_conta>=0?'green':'red');document.getElementById('usdtEq').textContent=S.usdt_equity.toFixed(2);document.getElementById('usdtAv').textContent=S.usdt_available.toFixed(2);document.getElementById('usdtUse').textContent=S.usdt_in_use.toFixed(2);document.getElementById('usdtUpl').textContent=S.usdt_upl.toFixed(2);document.getElementById('fundTxt').textContent=S.saldo_funding.toFixed(2);let so=document.getElementById('saldoOp');so.textContent=S.saldo_op.toFixed(4);so.className='big '+(S.saldo_op>=0?'green':'red');let rv=document.getElementById('reserva');rv.textContent=S.reserva.toFixed(4);rv.className='big '+(S.reserva>=0?'green':'red');document.getElementById('cofreOp').textContent=(S.cofre_op>=0?'+':'')+S.cofre_op.toFixed(4);document.getElementById('cofreResg').textContent=S.cofre_resgate.toFixed(4);document.getElementById('cofreG').textContent=S.cofre_global.toFixed(4);document.getElementById('margNec').textContent=S.margem_necessaria.toFixed(4)+' USDT';document.getElementById('alvoTxt').textContent=S.alvo_total.toFixed(4)+' USDT ('+S.settings.modo+')';document.getElementById('fonteSaldo').textContent=S.fonte_saldo;document.getElementById('passoSug').textContent=S.passo_sug;document.getElementById('negTxt').textContent=S.negativas+' negativas (max 2 total, max 1/lado)';document.getElementById('alavTxt').textContent=S.alav_okx||'--';document.getElementById('execBox').innerHTML=`<div class="exec">${S.execucao}</div>`;document.getElementById('loteBox').innerHTML=`<div class="small" style="color:#f1c40f">LOTE OKX: ${S.lote_info} | Sz exemplo: ${S.sz_exemplo||''} contratos | REGRAS DO COMECO + FALHAS CORRIGIDAS</div>`;document.getElementById('posOkxBox').innerHTML=`<div class="small" style="color:#2ecc71">POSICOES OKX (verdade): ${S.pos_okx||''}</div>`;document.getElementById('chavesBox').innerHTML=`<div class="chaves">CORRETORA: ${S.settings.corretora} | CONTA: ${S.settings.conta} | MOEDA: ${S.settings.moeda} | CHAVES: ${S.chaves} | Est total: ${S.est_total_usd} | USDT Equity: ${S.usdt_equity} | Available: ${S.usdt_available} | In use: ${S.usdt_in_use} | Funding: ${S.saldo_funding} | Alav OKX: ${S.alav_okx}</div>`;document.getElementById('erroBox').innerHTML=S.erro_bybit?`<div class="erro">ERRO OKX: ${S.erro_bybit}</div>`:'';document.getElementById('encBox').innerHTML=S.encerramento?'<div class="enc">ENCERRAMENTO - Atingiu o alvo '+S.alvo_total+'. Parou de abrir novas.</div>':'';let pnlTot=S.saldo_op - S.saldo_op_inicio;document.getElementById('status').innerHTML=`<div class="${S.running?'green':'red'}">${S.running?'A OPERAR - FLUTUANTE':'PARADO'}</div><div class="small">Par: ${S.settings.moeda}/USDT | Preco: ${S.price} | Ref: ${S.ref} (= Preco) | Modo: ${S.settings.conta} | Futures ${S.settings.moeda}-USDT-SWAP</div><div style="background:#12331f;padding:6px;border-radius:6px;margin-top:6px">GRID FLUTUANTE - Total ${S.orders.length} / ${S.settings.total_ordens} | Negativas: ${S.negativas} / 2 max</div>`;document.getElementById('pos').innerHTML=`<div>Preco: ${S.price} | Ref: ${S.ref}</div><div class="big ${pnlTot>=0?'green':'red'}">${pnlTot>=0?'+':''}${pnlTot.toFixed(4)} USDT — P&L total operacao virtual</div><div class="small">P&L vivo ACTIVE: ${S.pnl.toFixed(4)} | Cofre Op: ${S.cofre_op.toFixed(4)} | Cofre Resgate: ${S.cofre_resgate.toFixed(4)} | Cofre Global = Est total: ${S.cofre_global.toFixed(4)} | PnL acumulado: ${S.pnl_acumulado}</div><div>Saldo Op virtual: ${S.saldo_op} | Em uso virtual: ${S.em_uso} | Livre virtual: ${(S.saldo_op - S.em_uso).toFixed(4)} | Margem necess.: ${S.margem_necessaria} | Sz por ordem: ${S.sz_exemplo||''} contratos</div>`;document.getElementById('refbar').textContent=`Ref: ${S.ref} • Preço: ${S.price} (Ref = Preco)`;document.getElementById('merc').innerHTML=`Preco: ${S.price} | Ref: ${S.ref} | Moeda: ${S.settings.moeda}`;document.getElementById('traj').textContent=S.trajetoria;document.getElementById('contagem').textContent=`${S.orders.length} / ${S.settings.total_ordens} | ${S.orders.filter(o=>o.tipo==='ACTIVE').length} ACTIVE | ${S.orders.filter(o=>o.tipo==='PENDING').length} PENDING`;let sh=S.orders.filter(o=>o.lado==='SHORT').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.espelho_okx? '• ESPELHO OKX':''} ${o.okx_ord_id? '• OKX '+o.okx_ord_id.slice(0,8):''} ${o.closing? '• A FECHAR - NAO MANDA OUTRA VEZ':''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)} • Sz ${o.sz||''}<br>${faltaTxt(o)}</div>`).join('')||'—';let lo=S.orders.filter(o=>o.lado==='LONG').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.espelho_okx? '• ESPELHO OKX':''} ${o.okx_ord_id? '• OKX '+o.okx_ord_id.slice(0,8):''} ${o.closing? '• A FECHAR - NAO MANDA OUTRA VEZ':''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)} • Sz ${o.sz||''}<br>${faltaTxt(o)}</div>`).join('')||'—';document.getElementById('shorts').innerHTML=sh;document.getElementById('longs').innerHTML=lo;let btn=document.getElementById('mainBtn');btn.textContent=S.running?'PARAR ROBÔ':'INICIAR BOT';btn.className='btn '+(S.running?'btn-stop':'btn-start');let tot=S.pnl_acumulado;document.getElementById('histResumo').innerHTML=`<div class="big ${tot>=0?'green':'red'}">${tot>=0?'+':''}${tot.toFixed(4)} USDT — total</div><div class="small">LONG: ${S.pnl_long.toFixed(4)} + SHORT: ${S.pnl_short.toFixed(4)} = ${tot.toFixed(4)}</div>`;document.getElementById('hist').innerHTML=S.history.map(x=>`<div class="histline">${x.lado} GRID-FLUT | ${x.hora} | ${x.pnl>=0?'+':''}${x.pnl} USDT<br>${x.entrada} → ${x.saida} • ${x.motivo}</div>`).join('');let refs=S.orders.length?S.orders.map(o=>o.ref):[S.ref];let mn=Math.min(...refs,S.price)-50;let mx=Math.max(...refs,S.price)+50;let posP=(1-(S.price-mn)/(mx-mn))*100;let posR=(1-(S.ref-mn)/(mx-mn))*100;let pl=document.getElementById('priceLine');pl.style.top=posP+'%';let rl=document.getElementById('refLine');rl.style.top=posR+'%';let lbl=document.getElementById('priceLabel');lbl.style.top=(posP-8)+'px';lbl.textContent=S.price;let dots=S.orders.filter(o=>o.tipo==='ACTIVE').map(o=>{let y=(1-(o.ref-mn)/(mx-mn))*100;let c=o.lado==='LONG'?'#2ecc71':'#e74c3c';return `<div style="position:absolute;left:${o.lado==='LONG'?'20%':'70%'};top:${y}%;width:10px;height:10px;border-radius:50%;background:${c}"></div>`}).join('');document.getElementById('ordDots').innerHTML=dots;if(!ajPreenchido){ajPreenchido=true;document.getElementById('f_corretora').value=S.settings.corretora;document.getElementById('f_conta_tipo').value=S.settings.conta;document.getElementById('f_moeda').value=S.settings.moeda;document.getElementById('f_conta').value=S.settings.saldo_conta;document.getElementById('f_saldo_op').value=S.settings.saldo_op;document.getElementById('f_margem').value=S.settings.margem;document.getElementById('f_alav').value=S.settings.alav;document.getElementById('f_passo').value=S.settings.passo;document.getElementById('f_total').value=S.settings.total_ordens;document.getElementById('f_lucro').value=S.settings.lucro_op;document.getElementById('f_modo').value=S.settings.modo;document.getElementById('f_ops').value=S.settings.ops_dia;}}
 async function toggle(){if(S.running){await fetch('/api/toggle',{method:'POST'});ajPreenchido=false;load();return} if(S.settings.conta==='REAL'){if(!confirm('ATENCAO: Vais operar com DINHEIRO REAL na OKX. Confirmas?')) return} if(S.settings.conta==='TESTE'){if(!confirm('Vais operar na DEMO OKX Futures com ordens reais na Demo. Confirmas?')) return} await fetch('/api/toggle',{method:'POST'});ajPreenchido=false;load()}
 async function salvar(){let b={corretora:document.getElementById('f_corretora').value,conta:document.getElementById('f_conta_tipo').value,moeda:document.getElementById('f_moeda').value,saldo_conta:parseFloat(document.getElementById('f_conta').value),saldo_op:parseFloat(document.getElementById('f_saldo_op').value),margem:parseFloat(document.getElementById('f_margem').value),alav:parseFloat(document.getElementById('f_alav').value),passo:parseFloat(document.getElementById('f_passo').value),total_ordens:parseFloat(document.getElementById('f_total').value),lucro_op:parseFloat(document.getElementById('f_lucro').value),modo:document.getElementById('f_modo').value,ops_dia:parseFloat(document.getElementById('f_ops').value)};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert('Guardado');ajPreenchido=false;load()}
 setInterval(load,1500);load();
@@ -582,7 +692,6 @@ def toggle():
             sync_saldo_real(); real = state.get("saldo_conta_real")
         if real is None: return jsonify({"ok":False,"erro":"Sem leitura OKX."}), 400
         need = margem_necessaria()*total_max()
-        # Compara com Available USDT, nao com Est total, porque Est total inclui OKB/BTC/ETH que nao sao margem
         if state.get("usdt_available",0) < need: return jsonify({"ok":False,"erro":f"USDT Available insuficiente: {state.get('usdt_available')} < {need}"}), 400
         if not okx_set_leverage():
             return jsonify({"ok":False,"erro":"Falha a mandar alavancagem para OKX. Ve ERRO OKX."}), 400
@@ -591,11 +700,28 @@ def toggle():
         p=fetch_price()
         if p>0: state["price"]=p
         state["ref"]=state["price"]; state["saldo_op_inicio"]=state["settings"]["saldo_op"]; state["saldo_op"]=state["settings"]["saldo_op"]; state["cofre_op"]=0.0; state["cofre_resgate"]=0.0; state["pnl_acumulado"]=0.0; state["pnl_long"]=0.0; state["pnl_short"]=0.0; state["encerramento"]=False; state["alvo_total"]=alvo_total()
+        # Antes de comecar, limpa limites fantasmas antigas da OKX
+        if executar_okx():
+            try:
+                d, err = okx_get(f"/api/v5/trade/orders-pending?instType=SWAP&instId={moeda_cfg()[0]['inst_okx']}")
+                if d:
+                    for oo in d.get("data",[]):
+                        okx_cancel_order(oo.get("ordId"))
+            except: pass
         state["orders"]=build_grid(state["ref"], state["settings"]["passo"]); state["history"]=[]
+        # Cria limites na OKX para as 20 PENDING iniciais - 1 para 1
+        if executar_okx():
+            for o in state["orders"]:
+                oid, err, sz_str = okx_place_limit(o["lado"], o["ref"])
+                if not err:
+                    o["okx_ord_id"]=oid; o["sz"]=sz_str
         try: okx_lote()
         except: pass
         state["execucao"]=f"OKX {'DEMO' if is_teste() else 'REAL'} - ORDENS REAIS" if executar_okx() else "PAPEL - Simulacao"
     else:
+        # Ao parar, cancela todas as limites pendentes na OKX - nao deixa fantasmas
+        if executar_okx():
+            okx_cancel_all_open()
         state["orders"]=[]; state["ref"]=state["price"]; state["encerramento"]=False
     save(state); return jsonify({"ok":True})
 @app.route("/api/settings",methods=["POST"])
@@ -606,7 +732,6 @@ def settings():
     if d.get("moeda"): d["moeda"]=MAP_MOEDA.get(str(d["moeda"]).strip().lower(), "BTC")
     if d.get("modo"): d["modo"]=MAP_MODO.get(str(d["modo"]).strip().lower(), "Manual")
     state["settings"].update(d)
-    # Em TESTE/REAL, saldo conta vem da OKX, nao do campo digitado
     if is_papel():
         state["saldo_conta"]=d.get("saldo_conta",state["saldo_conta"]); state["saldo_conta_inicio"]=state["saldo_conta"]; state["cofre_global"]=state["saldo_conta"]
     state["saldo_op"]=d.get("saldo_op",state["saldo_op"]); state["saldo_op_inicio"]=state["saldo_op"]; state["alvo_total"]=alvo_total()
