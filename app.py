@@ -1,16 +1,15 @@
-# ND-SCALPING V6 - LE SALDO REAL BYBIT - SEM PROTECAO ANTECIPADA
-# Agora LE as chaves do Render. Se puseres BYBIT_API_KEY + BYBIT_API_SECRET no Render, ele le o Saldo da Conta real.
-# Se nao puser, continua em PAPEL com o valor dos Ajustes. Nunca trava.
-# Ordens continuam em PAPEL virtual, mas Saldo da Conta passa a ser o real da Bybit.
-# SEM FECHO POR PROTECAO. Negativa NUNCA fecha por estar negativa.
-# Grid finito 5 LONG + 5 SHORT, total = N Total Ordens. 1 fecha = 1 nasce. Trava 60%, recuo 10% / 15%, infinito.
-# Margem necessaria = Valor (ate 5) / Alavancagem. Taxa real 0.055% x2. Slippage 1-2. Atraso 1.5-2.5s.
-# Paragem Manual = Lucro por Operacao. Automatico = Lucro x Operacoes. Negativa so fecha se Total >= Alvo.
+# ND-SCALPING V6 - PERMISSOES BYBIT CORRIGIDAS - SEM PROTECAO ANTECIPADA
+# CORRECAO: Assinatura v5 correta da Bybit. Antes estava errada: punha api_key e timestamp no query, a Bybit rejeitava.
+# Agora: query = accountType=UNIFIED apenas. Sign = timestamp + api_key + recv_window + query. Headers com X-BAPI-SIGN-TYPE:2.
+# CORRECAO: Leitura do saldo em thread separada, nunca trava o loop principal. Se a Bybit falhar, continua em PAPEL.
+# CORRECAO: Tenta Mainnet e Testnet. Se BYBIT_TESTNET=true usa Testnet, se false usa Real. Se falhar numa, mostra o erro exato da Bybit no Dashboard.
+# Visual antigo exato. Ajustes iguais. SEM FECHO POR PROTECAO. Negativa nunca fecha por estar negativa.
+# Grid finito, 1 fecha = 1 nasce. Trava 60%, recuo 10% / 15%, infinito. Taxa 0.055% x2. Slippage 1-2. Atraso 1.5-2.5s.
 import os, json, time, threading, random, hashlib, hmac, urllib.request, urllib.parse
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, render_template_string
 app = Flask(__name__)
-DATA_FILE = "/tmp/nd_v6_real.json"
+DATA_FILE = "/tmp/nd_v6_permissoes.json"
 def now(): return (datetime.utcnow() + timedelta(hours=1)).strftime("%H:%M:%S")
 def load():
     try:
@@ -21,54 +20,79 @@ def save(s):
         with open(DATA_FILE,"w") as f: json.dump(s,f)
     except: pass
 def default_state():
-    return {"running":False,"price":0.0,"ref":0.0,"saldo_conta":100.0,"saldo_conta_inicio":100.0,"saldo_conta_real":None,"saldo_op":25.0,"saldo_op_inicio":25.0,"em_uso":0.0,"reserva":75.0,"cofre_op":0.0,"cofre_global":100.0,"pnl_acumulado":0.0,"pnl_long":0.0,"pnl_short":0.0,"orders":[],"history":[],"encerramento":False,"alvo_total":0.0,"chaves":"NAO LIGADAS - Sem BYBIT_API_KEY no Render","fonte_saldo":"Ajustes (PAPEL)","settings":{"saldo_conta":100.0,"saldo_op":25.0,"margem":5.0,"alav":15,"passo":25,"total_ordens":10,"lucro_op":5,"modo":"Manual","ops_dia":8},"last_update":"--","fonte":"Bybit - a ligar...","trajetoria":"a descer"}
+    return {"running":False,"price":0.0,"ref":0.0,"saldo_conta":100.0,"saldo_conta_inicio":100.0,"saldo_conta_real":None,"saldo_op":25.0,"saldo_op_inicio":25.0,"em_uso":0.0,"reserva":75.0,"cofre_op":0.0,"cofre_global":100.0,"pnl_acumulado":0.0,"pnl_long":0.0,"pnl_short":0.0,"orders":[],"history":[],"encerramento":False,"alvo_total":0.0,"chaves":"A VERIFICAR - Sem BYBIT_API_KEY no Render","fonte_saldo":"Ajustes (PAPEL)","erro_bybit":"","settings":{"saldo_conta":100.0,"saldo_op":25.0,"margem":5.0,"alav":15,"passo":25,"total_ordens":10,"lucro_op":5,"modo":"Manual","ops_dia":8},"last_update":"--","fonte":"Bybit - a ligar...","trajetoria":"a descer"}
 state = load() or default_state()
+# Garante campos novos se o ficheiro antigo nao os tem - nao apaga os Ajustes
+for k,v in default_state().items():
+    if k not in state: state[k]=v
 LAST_REAL = [state.get("price") or 0.0]
-# --- BYBIT PRIVADA: le saldo real com as chaves do Render ---
+# --- BYBIT v5 CORRETO: permissao Read apenas, assinatura certa ---
+def bybit_signed_get(base, path, query_dict):
+    key = os.environ.get("BYBIT_API_KEY","").strip()
+    secret = os.environ.get("BYBIT_API_SECRET","").strip()
+    if not key or not secret: return None, "Sem BYBIT_API_KEY no Render"
+    ts = str(int(time.time()*1000))
+    recv = "5000"
+    query = urllib.parse.urlencode(sorted(query_dict.items()))
+    # v5: sign = timestamp + api_key + recv_window + queryString
+    sign_str = ts + key + recv + query
+    sign = hmac.new(secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+    url = base + path + ("?" + query if query else "")
+    req = urllib.request.Request(url, headers={"X-BAPI-API-KEY":key,"X-BAPI-TIMESTAMP":ts,"X-BAPI-RECV-WINDOW":recv,"X-BAPI-SIGN":sign,"X-BAPI-SIGN-TYPE":"2","User-Agent":"Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=4) as r:
+        return json.loads(r.read().decode()), None
 def bybit_wallet_balance():
     key = os.environ.get("BYBIT_API_KEY","").strip()
     secret = os.environ.get("BYBIT_API_SECRET","").strip()
-    testnet = os.environ.get("BYBIT_TESTNET","true").lower() in ("true","1","yes")
     if not key or not secret:
         state["chaves"]="NAO LIGADAS - Sem BYBIT_API_KEY no Render"
         state["fonte_saldo"]="Ajustes (PAPEL)"
+        state["erro_bybit"]=""
         return None
-    base = "https://api-testnet.bybit.com" if testnet else "https://api.bybit.com"
-    try:
-        ts = str(int(time.time()*1000))
-        params = {"api_key":key,"timestamp":ts,"accountType":"UNIFIED"}
-        # Assinatura v5: timestamp + api_key + recv_window + query
-        recv = "5000"
-        query = urllib.parse.urlencode(sorted(params.items()))
-        sign_str = ts + key + recv + query
-        sign = hmac.new(secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-        url = base + "/v5/account/wallet-balance?" + query
-        req = urllib.request.Request(url, headers={"X-BAPI-API-KEY":key,"X-BAPI-TIMESTAMP":ts,"X-BAPI-RECV-WINDOW":recv,"X-BAPI-SIGN":sign,"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=6) as r:
-            d = json.loads(r.read().decode())
-            # Procura USDT em UNIFIED / CONTRACT / SPOT
+    testnet_env = os.environ.get("BYBIT_TESTNET","").strip().lower()
+    # Se nao definiste BYBIT_TESTNET, tenta Real primeiro, depois Testnet. Nunca trava.
+    bases = []
+    if testnet_env in ("true","1","yes"): bases = ["https://api-testnet.bybit.com"]
+    elif testnet_env in ("false","0","no"): bases = ["https://api.bybit.com"]
+    else: bases = ["https://api.bybit.com","https://api-testnet.bybit.com"]
+    last_err = ""
+    for base in bases:
+        try:
+            # PERMISSAO: so precisa de Read. Endpoint: /v5/account/wallet-balance?accountType=UNIFIED
+            d, err = bybit_signed_get(base, "/v5/account/wallet-balance", {"accountType":"UNIFIED"})
+            if err: last_err = err; continue
+            if d.get("retCode")!=0:
+                last_err = f"Bybit {base} retCode {d.get('retCode')}: {d.get('retMsg')}"
+                # 10003 = assinatura errada, 10004 = chave errada, 10005 = permissao / IP, 10006 = Testnet vs Real trocado
+                continue
             total = 0.0
             for acc in d.get("result",{}).get("list",[]):
                 for c in acc.get("coin",[]):
                     if c.get("coin")=="USDT":
                         try: total += float(c.get("walletBalance") or 0)
                         except: pass
-            if total>0 or d.get("retCode")==0:
-                state["chaves"]="LIGADAS - "+("TESTNET" if testnet else "REAL")
-                state["fonte_saldo"]="Bybit Real - Wallet Balance"
-                return round(total,4)
-            else:
-                state["chaves"]=f"ERRO BYBIT: {d.get('retMsg','sem resposta')} - Verifica as chaves no Render"
-                return None
-    except Exception as e:
-        state["chaves"]=f"ERRO A LER BYBIT: {str(e)[:120]} - Verifica chaves / Testnet / Permissao Read"
-        return None
+            is_test = "testnet" in base
+            state["chaves"]="LIGADAS - "+("TESTNET" if is_test else "REAL")
+            state["fonte_saldo"]="Bybit Real - Wallet Balance"
+            state["erro_bybit"]=""
+            return round(total,4)
+        except Exception as e:
+            last_err = f"{base}: {str(e)[:150]}"
+            continue
+    state["chaves"]="ERRO A LER BYBIT - Continua em PAPEL, nao trava"
+    state["fonte_saldo"]="Ajustes (PAPEL) - Falha Bybit"
+    state["erro_bybit"]=last_err
+    return None
+def sync_thread():
+    # Thread separada: nunca bloqueia o loop principal, nunca congela o preço.
+    while True:
+        try: sync_saldo_real()
+        except Exception as e: print("sync",e)
+        time.sleep(12)
 def sync_saldo_real():
-    # So sincroniza o Saldo da Conta. Nao mexe no Saldo da Operacao, que e a parte a operar.
     real = bybit_wallet_balance()
     if real is not None:
         state["saldo_conta_real"]=real
-        # Se nao esta a operar, atualiza Conta e Reserva. Se esta a operar, soma o PnL ao real.
         if not state.get("running"):
             state["saldo_conta"]=real
             state["saldo_conta_inicio"]=real
@@ -79,6 +103,7 @@ def sync_saldo_real():
             state["reserva"]=round(state["saldo_conta"] - state["saldo_op"],4)
         return True
     return False
+threading.Thread(target=sync_thread,daemon=True).start()
 def fetch_bybit_price():
     for url in ["https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT","https://api.bytick.com/v5/market/tickers?category=linear&symbol=BTCUSDT"]:
         try:
@@ -133,7 +158,6 @@ def close_order(o, exit_price, motivo):
     else: state["pnl_short"]=round(state.get("pnl_short",0)+pnl,4)
     state["saldo_op"]=round(state["saldo_op_inicio"]+state["pnl_acumulado"],4)
     state["cofre_op"]=round(state["pnl_acumulado"],4)
-    # Se tem saldo real, Conta = Real + PnL. Se nao, Conta = Inicio + PnL.
     base = state.get("saldo_conta_real") if state.get("saldo_conta_real") is not None else state["saldo_conta_inicio"]
     state["cofre_global"]=round(state["saldo_conta"]+pnl,4)
     state["saldo_conta"]=round(base+state["pnl_acumulado"],4)
@@ -145,15 +169,11 @@ def born_opposite(close_price, lado_fechado, passo):
     if lado_fechado=="LONG": ref=round(close_price-passo,1); return mk_order("SHORT",ref,passo,"REBALANCEAMENTO")
     else: ref=round(close_price+passo,1); return mk_order("LONG",ref,passo,"REBALANCEAMENTO")
 def bot_loop():
-    loop_n=0
     while True:
         try:
             p=fetch_bybit_price()
             if p>0: state["price"]=p; state["last_update"]=now()
             if not state["running"]: state["ref"]=p
-            # Sincroniza saldo real a cada 10 loops (~12s) para nao sobrecarregar a API
-            loop_n+=1
-            if loop_n%10==0: sync_saldo_real()
             if state["running"] and state["price"]>0:
                 price=state["price"]; passo=state["settings"]["passo"] or 25; orders=state["orders"]
                 seen=set(); uniq=[]
@@ -196,9 +216,7 @@ def bot_loop():
                                     close_order(o,price,motivo); orders.remove(o)
                                     if not state.get("encerramento"): add_order_keep_cap(born_opposite(price,o["lado"],passo))
                                     break
-                        else:
-                            o["trava"]="A ESPERA - NAO FECHA NEGATIVA"
-                            pass
+                        else: o["trava"]="A ESPERA - NAO FECHA NEGATIVA"
                 if state.get("encerramento"):
                     ativos=[x for x in orders if x["tipo"]=="ACTIVE"]
                     if not ativos:
@@ -241,11 +259,11 @@ def bot_loop():
 threading.Thread(target=bot_loop,daemon=True).start()
 HTML='''
 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ND-SCALPING</title><style>
-*{box-sizing:border-box}body{margin:0;background:#0f1115;color:#fff;font-family:Arial,sans-serif;padding-bottom:90px}.top{background:#1a1d24;padding:10px 12px;position:sticky;top:0}.top b{color:#2ecc71;font-size:22px}.papel{color:#ff8c00;font-weight:bold}.small{color:#aaa;font-size:12px}.card{background:#1a1d24;margin:10px;border-radius:10px;padding:12px}.green{color:#2ecc71}.red{color:#e74c3c}.big{font-size:26px;font-weight:bold}.grid{display:flex;gap:8px}.box{flex:1;border-radius:8px;padding:8px}.short{background:#3a1414}.long{background:#12331f}.refbar{background:#f1c40f;color:#000;text-align:center;padding:6px;border-radius:6px;font-weight:bold;margin:8px 0}.ord{border-bottom:1px solid #333;padding:6px 0;font-size:13px}.btn{width:100%;padding:14px;border:0;border-radius:8px;font-weight:bold;font-size:16px;cursor:pointer}.btn-start{background:#2ecc71;color:#fff}.btn-stop{background:#e74c3c;color:#fff}.btn-save{background:#3498db;color:#fff;padding:12px}.inp{width:100%;padding:10px;border-radius:6px;border:1px solid #333;background:#0f1115;color:#fff;margin:4px 0 10px}label{font-size:13px;color:#ddd}.tabs{position:fixed;bottom:0;left:0;right:0;display:flex;background:#1a1d24;border-top:1px solid #333}.tabs button{flex:1;padding:14px;background:none;border:0;color:#aaa;font-weight:bold}.tabs button.on{color:#2ecc71}.hidden{display:none}.trava{color:#f1c40f;font-size:11px}.histline{border-bottom:1px solid #333;padding:6px 0;font-size:13px}.enc{background:#f1c40f;color:#000;padding:6px;border-radius:6px;font-weight:bold;text-align:center;margin-top:6px}.chaves{padding:6px;border-radius:6px;font-weight:bold;margin-top:6px;background:#12331f}
+*{box-sizing:border-box}body{margin:0;background:#0f1115;color:#fff;font-family:Arial,sans-serif;padding-bottom:90px}.top{background:#1a1d24;padding:10px 12px;position:sticky;top:0}.top b{color:#2ecc71;font-size:22px}.papel{color:#ff8c00;font-weight:bold}.small{color:#aaa;font-size:12px}.card{background:#1a1d24;margin:10px;border-radius:10px;padding:12px}.green{color:#2ecc71}.red{color:#e74c3c}.big{font-size:26px;font-weight:bold}.grid{display:flex;gap:8px}.box{flex:1;border-radius:8px;padding:8px}.short{background:#3a1414}.long{background:#12331f}.refbar{background:#f1c40f;color:#000;text-align:center;padding:6px;border-radius:6px;font-weight:bold;margin:8px 0}.ord{border-bottom:1px solid #333;padding:6px 0;font-size:13px}.btn{width:100%;padding:14px;border:0;border-radius:8px;font-weight:bold;font-size:16px;cursor:pointer}.btn-start{background:#2ecc71;color:#fff}.btn-stop{background:#e74c3c;color:#fff}.btn-save{background:#3498db;color:#fff;padding:12px}.inp{width:100%;padding:10px;border-radius:6px;border:1px solid #333;background:#0f1115;color:#fff;margin:4px 0 10px}label{font-size:13px;color:#ddd}.tabs{position:fixed;bottom:0;left:0;right:0;display:flex;background:#1a1d24;border-top:1px solid #333}.tabs button{flex:1;padding:14px;background:none;border:0;color:#aaa;font-weight:bold}.tabs button.on{color:#2ecc71}.hidden{display:none}.trava{color:#f1c40f;font-size:11px}.histline{border-bottom:1px solid #333;padding:6px 0;font-size:13px}.enc{background:#f1c40f;color:#000;padding:6px;border-radius:6px;font-weight:bold;text-align:center;margin-top:6px}.chaves{padding:6px;border-radius:6px;font-weight:bold;margin-top:6px;background:#12331f}.erro{color:#e74c3c;font-size:12px}
 </style></head><body>
 <div class="top"><b>ND-SCALPING</b> <span class="papel">PAPEL</span><div class="small">Atualizado: <span id="upd">--</span> | Fonte: <span id="fonte">--</span> | Simulação Real Bybit - Taxa 0.055% | Slippage 1-2 | Atraso 1.5-2.5s | SEM PROTECAO ANTECIPADA</div></div>
 <div id="tab-dash">
-<div class="card"><b>STATUS - ANALISE BYBIT</b><div id="status"></div><div id="encBox"></div><div id="chavesBox"></div><div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap"><div><div class="small">SALDO TOTAL DA CONTA</div><div class="big" id="saldoConta">--</div></div><div><div class="small">SALDO EM OPERACAO</div><div class="big" id="saldoOp">--</div></div><div><div class="small">RESERVA</div><div class="big" id="reserva">--</div></div></div><div class="small">Conta = Inicio Conta +/- PnL | Operacao = Inicio Op +/- PnL | Reserva = Conta - Operacao | Cofre Op = <span id="cofreOp"></span> | Cofre Global = <span id="cofreG"></span> | Margem necess. = <span id="margNec"></span> | Alvo = <span id="alvoTxt"></span> | Fonte Saldo: <span id="fonteSaldo"></span></div></div>
+<div class="card"><b>STATUS - ANALISE BYBIT</b><div id="status"></div><div id="encBox"></div><div id="chavesBox"></div><div id="erroBox"></div><div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap"><div><div class="small">SALDO TOTAL DA CONTA</div><div class="big" id="saldoConta">--</div></div><div><div class="small">SALDO EM OPERACAO</div><div class="big" id="saldoOp">--</div></div><div><div class="small">RESERVA</div><div class="big" id="reserva">--</div></div></div><div class="small">Conta = Inicio Conta +/- PnL | Operacao = Inicio Op +/- PnL | Reserva = Conta - Operacao | Cofre Op = <span id="cofreOp"></span> | Cofre Global = <span id="cofreG"></span> | Margem necess. = <span id="margNec"></span> | Alvo = <span id="alvoTxt"></span> | Fonte Saldo: <span id="fonteSaldo"></span></div></div>
 <div class="card"><b>POSICAO ATUAL - AO VIVO</b><div id="pos"></div><button id="mainBtn" class="btn btn-start" onclick="toggle()">INICIAR BOT</button></div>
 <div class="card"><b>GRID — REF NO CENTRO</b><div class="refbar" id="refbar">Ref: -- • Preço: --</div><div class="small trava">Grid finito: total = N programado. 1 fecha = 1 nasce. Trava 60%. Recuo 10% antes, 15% depois. Infinito. SEM PROTECAO - Negativa fica a espera.</div><div class="grid"><div class="box short"><b>▼ SHORT — ABAIXO DA REF</b><div id="shorts"></div></div><div class="box long"><b>▲ LONG — ACIMA DA REF</b><div id="longs"></div></div></div></div>
 </div>
@@ -266,11 +284,11 @@ HTML='''
 <script>
 let S={}; let ajPreenchido=false;
 function tab(n,el){['dash','merc','hist','aj'].forEach(x=>document.getElementById('tab-'+x).classList.toggle('hidden',x!==n));document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));el.classList.add('on')}
-async function load(){let r=await fetch('/api/state');S=await r.json();document.getElementById('upd').textContent=S.last_update;document.getElementById('fonte').textContent=S.fonte;let st=document.getElementById('saldoConta');st.textContent=S.saldo_conta.toFixed(4);st.className='big '+(S.saldo_conta>=0?'green':'red');let so=document.getElementById('saldoOp');so.textContent=S.saldo_op.toFixed(4);so.className='big '+(S.saldo_op>=0?'green':'red');let rv=document.getElementById('reserva');rv.textContent=S.reserva.toFixed(4);rv.className='big green';document.getElementById('cofreOp').textContent=(S.cofre_op>=0?'+':'')+S.cofre_op.toFixed(4);document.getElementById('cofreG').textContent=S.cofre_global.toFixed(4);document.getElementById('margNec').textContent=S.margem_necessaria.toFixed(4)+' USDT';document.getElementById('alvoTxt').textContent=S.alvo_total.toFixed(4)+' USDT ('+S.settings.modo+')';document.getElementById('fonteSaldo').textContent=S.fonte_saldo;document.getElementById('chavesBox').innerHTML=\`<div class="chaves">CHAVES: \${S.chaves} | Fonte Saldo: \${S.fonte_saldo} \${S.saldo_conta_real!==null?'| Saldo Real Bybit: '+S.saldo_conta_real:''}</div>\`;document.getElementById('encBox').innerHTML=S.encerramento?'<div class="enc">ENCERRAMENTO - Atingiu o alvo '+S.alvo_total+'. Parou de abrir novas. A espera das ACTIVE fecharem com lucro.</div>':'';let pnlTot=S.saldo_op - S.saldo_op_inicio;document.getElementById('status').innerHTML=\`<div class="\${S.running?'green':'red'}">\${S.running?'A OPERAR':'PARADO'}</div><div class="small">Par: BTC/USDT:USDT | Preco Bybit: \${S.price} | Ref: \${S.ref} | Modo: PAPEL - Simulação Real (ordens virtuais, saldo real)</div><div style="background:#12331f;padding:6px;border-radius:6px;margin-top:6px">GRID FINITO - Total \${S.orders.length} / \${S.settings.total_ordens} | Preco \${S.price} perto da media \${S.ref}.</div>\`;document.getElementById('pos').innerHTML=\`<div>Preco Bybit: \${S.price} | Ref: \${S.ref} | Entrada escolhida pelo robo: \${S.ref}</div><div class="big \${pnlTot>=0?'green':'red'}">\${pnlTot>=0?'+':''}\${pnlTot.toFixed(4)} USDT — P&L total (Saldo Op - Inicio Op)</div><div class="small">P&L vivo ACTIVE: \${S.pnl.toFixed(4)} | Cofre Op (soma PnL): \${S.cofre_op.toFixed(4)} | Cofre Global: \${S.cofre_global.toFixed(4)} | PnL acumulado (todas): \${S.pnl_acumulado}</div><div>Saldo Op: \${S.saldo_op} USDT | Em uso: \${S.em_uso} / \${S.saldo_op} USDT | Livre: \${(S.saldo_op - S.em_uso).toFixed(4)} USDT | Margem necess.: \${S.margem_necessaria} USDT</div>\`;document.getElementById('refbar').textContent=\`Ref: \${S.ref} • Preço: \${S.price}\`;document.getElementById('merc').innerHTML=\`Preco Bybit: \${S.price} | Ref: \${S.ref} | Moeda: BTC\`;document.getElementById('traj').textContent=S.trajetoria;document.getElementById('contagem').textContent=\`\${S.orders.length} / \${S.settings.total_ordens} ordens | \${S.orders.filter(o=>o.tipo==='ACTIVE').length} ACTIVE | \${S.orders.filter(o=>o.tipo==='PENDING').length} PENDING\`;let sh=S.orders.filter(o=>o.lado==='SHORT').map(o=>\`<div class="ord">\${o.lado} • \${o.tipo} \${o.origem? '• '+o.origem:''} \${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref \${o.ref} → \${o.alvo} • \${o.pnl.toFixed(4)}<br>Falta \${o.falta}% para o alvo \${o.passou_alvo?'• PASSOU ALVO - INFINITO':''}</div>\`).join('')||'—';let lo=S.orders.filter(o=>o.lado==='LONG').map(o=>\`<div class="ord">\${o.lado} • \${o.tipo} \${o.origem? '• '+o.origem:''} \${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref \${o.ref} → \${o.alvo} • \${o.pnl.toFixed(4)}<br>Falta \${o.falta}% para o alvo \${o.passou_alvo?'• PASSOU ALVO - INFINITO':''}</div>\`).join('')||'—';document.getElementById('shorts').innerHTML=sh;document.getElementById('longs').innerHTML=lo;let btn=document.getElementById('mainBtn');btn.textContent=S.running?'PARAR ROBÔ':'INICIAR BOT';btn.className='btn '+(S.running?'btn-stop':'btn-start');let h=S.history;let tot=S.pnl_acumulado;document.getElementById('histResumo').innerHTML=\`<div class="big \${tot>=0?'green':'red'}">\${tot>=0?'+':''}\${tot.toFixed(4)} USDT — total todas as ordens</div><div class="small">LONG: \${S.pnl_long.toFixed(4)} + SHORT: \${S.pnl_short.toFixed(4)} = \${tot.toFixed(4)} | Mostra ultimas 200, total = todas</div>\`;document.getElementById('hist').innerHTML=h.map(x=>\`<div class="histline">\${x.lado} GRID | \${x.hora} | \${x.pnl>=0?'+':''}\${x.pnl} USDT<br>\${x.entrada} → \${x.saida} • \${x.motivo}</div>\`).join('');let refs=S.orders.length?S.orders.map(o=>o.ref):[S.ref];let mn=Math.min(...refs,S.price)-50;let mx=Math.max(...refs,S.price)+50;let posP=(1-(S.price-mn)/(mx-mn))*100;let posR=(1-(S.ref-mn)/(mx-mn))*100;let pl=document.getElementById('priceLine');pl.style.top=posP+'%';let rl=document.getElementById('refLine');rl.style.top=posR+'%';let lbl=document.getElementById('priceLabel');lbl.style.top=(posP-8)+'px';lbl.textContent=S.price;let dots=S.orders.filter(o=>o.tipo==='ACTIVE').map(o=>{let y=(1-(o.ref-mn)/(mx-mn))*100;let c=o.lado==='LONG'?'#2ecc71':'#e74c3c';return \`<div style="position:absolute;left:\${o.lado==='LONG'?'20%':'70%'};top:\${y}%;width:10px;height:10px;border-radius:50%;background:\${c}"></div>\`}).join('');document.getElementById('ordDots').innerHTML=dots;if(!ajPreenchido){ajPreenchido=true;document.getElementById('f_conta').value=S.settings.saldo_conta;document.getElementById('f_saldo_op').value=S.settings.saldo_op;document.getElementById('f_margem').value=S.settings.margem;document.getElementById('f_alav').value=S.settings.alav;document.getElementById('f_passo').value=S.settings.passo;document.getElementById('f_total').value=S.settings.total_ordens;document.getElementById('f_lucro').value=S.settings.lucro_op;document.getElementById('f_modo').value=S.settings.modo;document.getElementById('f_ops').value=S.settings.ops_dia;}}
+async function load(){let r=await fetch('/api/state');S=await r.json();document.getElementById('upd').textContent=S.last_update;document.getElementById('fonte').textContent=S.fonte;let st=document.getElementById('saldoConta');st.textContent=S.saldo_conta.toFixed(4);st.className='big '+(S.saldo_conta>=0?'green':'red');let so=document.getElementById('saldoOp');so.textContent=S.saldo_op.toFixed(4);so.className='big '+(S.saldo_op>=0?'green':'red');let rv=document.getElementById('reserva');rv.textContent=S.reserva.toFixed(4);rv.className='big green';document.getElementById('cofreOp').textContent=(S.cofre_op>=0?'+':'')+S.cofre_op.toFixed(4);document.getElementById('cofreG').textContent=S.cofre_global.toFixed(4);document.getElementById('margNec').textContent=S.margem_necessaria.toFixed(4)+' USDT';document.getElementById('alvoTxt').textContent=S.alvo_total.toFixed(4)+' USDT ('+S.settings.modo+')';document.getElementById('fonteSaldo').textContent=S.fonte_saldo;document.getElementById('chavesBox').innerHTML=`<div class="chaves">CHAVES: ${S.chaves} | Fonte Saldo: ${S.fonte_saldo} ${S.saldo_conta_real!==null&&S.saldo_conta_real!==undefined?'| Saldo Real Bybit: '+S.saldo_conta_real:''}</div>`;document.getElementById('erroBox').innerHTML=S.erro_bybit?`<div class="erro">ERRO BYBIT: ${S.erro_bybit} | O bot continua em PAPEL, nao trava.</div>`:'';document.getElementById('encBox').innerHTML=S.encerramento?'<div class="enc">ENCERRAMENTO - Atingiu o alvo '+S.alvo_total+'. Parou de abrir novas. A espera das ACTIVE fecharem com lucro.</div>':'';let pnlTot=S.saldo_op - S.saldo_op_inicio;document.getElementById('status').innerHTML=`<div class="${S.running?'green':'red'}">${S.running?'A OPERAR':'PARADO'}</div><div class="small">Par: BTC/USDT:USDT | Preco Bybit: ${S.price} | Ref: ${S.ref} | Modo: PAPEL - Simulação Real (ordens virtuais, saldo real)</div><div style="background:#12331f;padding:6px;border-radius:6px;margin-top:6px">GRID FINITO - Total ${S.orders.length} / ${S.settings.total_ordens} | Preco ${S.price} perto da media ${S.ref}.</div>`;document.getElementById('pos').innerHTML=`<div>Preco Bybit: ${S.price} | Ref: ${S.ref} | Entrada escolhida pelo robo: ${S.ref}</div><div class="big ${pnlTot>=0?'green':'red'}">${pnlTot>=0?'+':''}${pnlTot.toFixed(4)} USDT — P&L total (Saldo Op - Inicio Op)</div><div class="small">P&L vivo ACTIVE: ${S.pnl.toFixed(4)} | Cofre Op (soma PnL): ${S.cofre_op.toFixed(4)} | Cofre Global: ${S.cofre_global.toFixed(4)} | PnL acumulado (todas): ${S.pnl_acumulado}</div><div>Saldo Op: ${S.saldo_op} USDT | Em uso: ${S.em_uso} / ${S.saldo_op} USDT | Livre: ${(S.saldo_op - S.em_uso).toFixed(4)} USDT | Margem necess.: ${S.margem_necessaria} USDT</div>`;document.getElementById('refbar').textContent=`Ref: ${S.ref} • Preço: ${S.price}`;document.getElementById('merc').innerHTML=`Preco Bybit: ${S.price} | Ref: ${S.ref} | Moeda: BTC`;document.getElementById('traj').textContent=S.trajetoria;document.getElementById('contagem').textContent=`${S.orders.length} / ${S.settings.total_ordens} ordens | ${S.orders.filter(o=>o.tipo==='ACTIVE').length} ACTIVE | ${S.orders.filter(o=>o.tipo==='PENDING').length} PENDING`;let sh=S.orders.filter(o=>o.lado==='SHORT').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)}<br>Falta ${o.falta}% para o alvo ${o.passou_alvo?'• PASSOU ALVO - INFINITO':''}</div>`).join('')||'—';let lo=S.orders.filter(o=>o.lado==='LONG').map(o=>`<div class="ord">${o.lado} • ${o.tipo} ${o.origem? '• '+o.origem:''} ${o.tipo==='ACTIVE'&&o.trava?'<span class="trava">• '+o.trava+'</span>':''}<br>Ref ${o.ref} → ${o.alvo} • ${o.pnl.toFixed(4)}<br>Falta ${o.falta}% para o alvo ${o.passou_alvo?'• PASSOU ALVO - INFINITO':''}</div>`).join('')||'—';document.getElementById('shorts').innerHTML=sh;document.getElementById('longs').innerHTML=lo;let btn=document.getElementById('mainBtn');btn.textContent=S.running?'PARAR ROBÔ':'INICIAR BOT';btn.className='btn '+(S.running?'btn-stop':'btn-start');let h=S.history;let tot=S.pnl_acumulado;document.getElementById('histResumo').innerHTML=`<div class="big ${tot>=0?'green':'red'}">${tot>=0?'+':''}${tot.toFixed(4)} USDT — total todas as ordens</div><div class="small">LONG: ${S.pnl_long.toFixed(4)} + SHORT: ${S.pnl_short.toFixed(4)} = ${tot.toFixed(4)} | Mostra ultimas 200, total = todas</div>`;document.getElementById('hist').innerHTML=h.map(x=>`<div class="histline">${x.lado} GRID | ${x.hora} | ${x.pnl>=0?'+':''}${x.pnl} USDT<br>${x.entrada} → ${x.saida} • ${x.motivo}</div>`).join('');let refs=S.orders.length?S.orders.map(o=>o.ref):[S.ref];let mn=Math.min(...refs,S.price)-50;let mx=Math.max(...refs,S.price)+50;let posP=(1-(S.price-mn)/(mx-mn))*100;let posR=(1-(S.ref-mn)/(mx-mn))*100;let pl=document.getElementById('priceLine');pl.style.top=posP+'%';let rl=document.getElementById('refLine');rl.style.top=posR+'%';let lbl=document.getElementById('priceLabel');lbl.style.top=(posP-8)+'px';lbl.textContent=S.price;let dots=S.orders.filter(o=>o.tipo==='ACTIVE').map(o=>{let y=(1-(o.ref-mn)/(mx-mn))*100;let c=o.lado==='LONG'?'#2ecc71':'#e74c3c';return `<div style="position:absolute;left:${o.lado==='LONG'?'20%':'70%'};top:${y}%;width:10px;height:10px;border-radius:50%;background:${c}"></div>`}).join('');document.getElementById('ordDots').innerHTML=dots;if(!ajPreenchido){ajPreenchido=true;document.getElementById('f_conta').value=S.settings.saldo_conta;document.getElementById('f_saldo_op').value=S.settings.saldo_op;document.getElementById('f_margem').value=S.settings.margem;document.getElementById('f_alav').value=S.settings.alav;document.getElementById('f_passo').value=S.settings.passo;document.getElementById('f_total').value=S.settings.total_ordens;document.getElementById('f_lucro').value=S.settings.lucro_op;document.getElementById('f_modo').value=S.settings.modo;document.getElementById('f_ops').value=S.settings.ops_dia;}}
 async function toggle(){await fetch('/api/toggle',{method:'POST'});ajPreenchido=false;load()}
 async function salvar(){let b={saldo_conta:parseFloat(document.getElementById('f_conta').value),saldo_op:parseFloat(document.getElementById('f_saldo_op').value),margem:parseFloat(document.getElementById('f_margem').value),alav:parseFloat(document.getElementById('f_alav').value),passo:parseFloat(document.getElementById('f_passo').value),total_ordens:parseFloat(document.getElementById('f_total').value),lucro_op:parseFloat(document.getElementById('f_lucro').value),modo:document.getElementById('f_modo').value,ops_dia:parseFloat(document.getElementById('f_ops').value)};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert('Guardado');ajPreenchido=false;load()}
 setInterval(load,1500);load();
-<\/script></body></html>
+</script></body></html>
 '''
 @app.route("/")
 def index(): return render_template_string(HTML)
@@ -281,7 +299,7 @@ def api_state():
 def toggle():
     state["running"]=not state["running"]
     if state["running"]:
-        p=fetch_bybit_price(); sync_saldo_real()
+        p=fetch_bybit_price()
         if p>0: state["price"]=p
         state["ref"]=state["price"]; state["saldo_op_inicio"]=state["settings"]["saldo_op"]; state["saldo_op"]=state["settings"]["saldo_op"]; state["reserva"]=round(state["saldo_conta"]-state["saldo_op"],4); state["cofre_op"]=0.0; state["cofre_global"]=state["saldo_conta"]; state["pnl_acumulado"]=0.0; state["pnl_long"]=0.0; state["pnl_short"]=0.0; state["encerramento"]=False; state["alvo_total"]=alvo_total()
         state["orders"]=build_grid(state["ref"], state["settings"]["passo"]); state["history"]=[]
@@ -290,7 +308,6 @@ def toggle():
 @app.route("/api/settings",methods=["POST"])
 def settings():
     d=request.get_json(force=True); state["settings"].update(d)
-    # Se chaves ligadas, Saldo da Conta vem da Bybit, ignora o campo. Se nao, usa o campo.
     if state.get("saldo_conta_real") is None:
         state["saldo_conta"]=d.get("saldo_conta",state["saldo_conta"]); state["saldo_conta_inicio"]=state["saldo_conta"]
     state["saldo_op"]=d.get("saldo_op",state["saldo_op"]); state["saldo_op_inicio"]=state["saldo_op"]; state["reserva"]=round(state["saldo_conta"]-state["saldo_op"],4); state["cofre_global"]=state["saldo_conta"]; state["alvo_total"]=alvo_total()
