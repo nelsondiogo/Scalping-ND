@@ -1,7 +1,8 @@
-# ND-SCALPING V6 - 3 CORRECOES - MANDA
+# ND-SCALPING V6 - LIMPA SOZINHO - MANDA
 # VISUAL IGUAL A FOTO. Cartoes SHORT vermelho / LONG verde ficam. Dentro: Lado - Tipo / Ref -> Alvo - PnL / Falta pontos. Em cima: Preco, Conta, Operacao, P&L vivo, botao PARAR ROBO, barra Ref amarela.
 # Lote, ordId, Fill, Fee, chaves ficam SO no codigo/logs.
-# CORRECAO 1 - FANTASMA: Cancela antiga PRIMEIRO. Se falhar, NAO cria nova. Ao INICIAR, verifica se ha limites/posicoes velhas na OKX: se houver, NAO arranca e avisa "ha ordem velha, limpa primeiro". Ao PARAR, cancela tudo dele.
+# NOVO - LIMPA SOZINHO: Ao INICIAR em TESTE/PAPEL, o bot cancela TODAS as limites abertas de BTC na OKX e fecha TODAS as posicoes abertas de BTC, sozinho, e so depois coloca o GRID novo limpo. Nunca mais bloqueia com "ha posicao velha". Em REAL, o bot so limpa depois do confirm que ja aparece no botao INICIAR. Ao PARAR, cancela tudo dele.
+# CORRECAO 1 - FANTASMA: Cancela antiga PRIMEIRO. Se falhar, NAO cria nova. Ao PARAR, cancela tudo dele.
 # CORRECAO 2 - PnL DIVERGENTE: PnL do cartao = sempre da entrada do bot. Compara com UPL OKX. Se diferenca > 0.50, PARA e avisa "PnL divergente". Se Sz OKX != Sz bot, NAO fecha e NAO conta no historico.
 # CORRECAO 3 - LUCRO PEQUENO: Trava SO depois de armar a 40% do passo. Antes de armar, NAO fecha por nada. Depois de armar, SO fecha se recuo >= 20% do passo E PnL depois da taxa > 0. Se passar alvo, deixa correr para infinito.
 import os, json, time, threading, random, hashlib, hmac, urllib.request, urllib.parse, base64, math
@@ -9,7 +10,7 @@ from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string
 app = Flask(__name__)
-DATA_FILE = "/tmp/nd_v6_3correcoes.json"
+DATA_FILE = "/tmp/nd_v6_limpa_sozinho.json"
 def now(): return (datetime.utcnow() + timedelta(hours=1)).strftime("%H:%M:%S")
 def load(): return json.load(open(DATA_FILE)) if os.path.exists(DATA_FILE) else None
 def save(s): open(DATA_FILE,"w").write(json.dumps(s))
@@ -322,6 +323,44 @@ def okx_place_limit(lado, ref_price):
     except: oid=""
     log(f"PLACE {lado} Ref {ref_price} Sz {sz_str} ord {oid}")
     return oid, None, sz_str
+def okx_close_position_raw(pos):
+    # Fecha posicao velha na OKX pelo tamanho total dela, a mercado. Usado SO na limpeza automatica ao INICIAR.
+    cfg,_ = moeda_cfg()
+    lote=okx_lote()
+    sz_str=fmt_sz(pos["pos_contratos"], lote["lotSz"])
+    side="sell" if pos["lado"]=="LONG" else "buy"
+    payload={"instId":cfg["inst_okx"],"tdMode":"cross","side":side,"posSide":"long" if pos["lado"]=="LONG" else "short","ordType":"market","sz":sz_str}
+    d, err = okx_post("/api/v5/trade/order", payload)
+    if err: return False, err
+    log(f"AUTO-LIMPEZA fechou posicao velha {pos['lado']} {sz_str} entry {pos['entry']}")
+    return True, None
+def okx_auto_limpeza():
+    # LIMPA SOZINHO: cancela TODAS as limites + fecha TODAS as posicoes de BTC na conta actual (TESTE/REAL OKX). So corre ao INICIAR.
+    if not executar_real() or corretora_atual()!="OKX": return True, None
+    pend, err1 = okx_get_pending()
+    if err1: return False, f"Nao consegui ver ordens velhas na OKX: {err1}"
+    n_cancel=0
+    for o in pend or []:
+        oid=o.get("ordId")
+        if oid:
+            ok, errc = okx_cancel_order(oid)
+            if ok: n_cancel+=1
+            else: log(f"AUTO-LIMPEZA falhou cancelar {oid}: {errc}")
+    pos, err2 = okx_get_positions()
+    if err2: return False, f"Nao consegui ver posicoes velhas na OKX: {err2}"
+    n_fech=0
+    for p in pos or []:
+        ok, errf = okx_close_position_raw(p)
+        if ok: n_fech+=1
+        else: log(f"AUTO-LIMPEZA falhou fechar {p}: {errf}")
+    log(f"AUTO-LIMPEZA: cancelou {n_cancel} limite(s), fechou {n_fech} posicao(oes)")
+    time.sleep(1.0)
+    # Confirma que ficou limpo
+    pend2, _ = okx_get_pending()
+    pos2, _ = okx_get_positions()
+    if (pend2 and len(pend2)>0) or (pos2 and len(pos2)>0):
+        return False, f"Limpeza incompleta: ainda ha {len(pend2 or [])} limite(s) e {len(pos2 or [])} posicao(oes). Tenta INICIAR outra vez."
+    return True, None
 def okx_move_pending(o, novo_ref):
     # CORRECAO 1: Cancela antiga PRIMEIRO. Se falhar, NAO cria nova.
     if executar_real() and corretora_atual()=="OKX" and o.get("okx_ord_id"):
@@ -337,19 +376,6 @@ def okx_move_pending(o, novo_ref):
             state["erro"]=f"Falha criar nova limite {o['lado']} {novo_ref}: {err}"; log(f"MOVE FAIL place {err}"); return False
         o["okx_ord_id"]=oid; o["sz"]=sz_str
     return True
-def check_start_clean():
-    # CORRECAO 1 - travas de arranque: se houver posicao ou limite velha na OKX, NAO arranca.
-    if not executar_real() or corretora_atual()!="OKX": return True, None
-    pend, err1 = okx_get_pending()
-    if err1: return False, f"Nao consegui ver ordens velhas na OKX: {err1}"
-    if pend:
-        return False, f"Ha ordem velha, limpa primeiro: {len(pend)} limite(s) aberta(s) na OKX. Cancela tudo a mao e arranca de novo."
-    pos, err2 = okx_get_positions()
-    if err2: return False, f"Nao consegui ver posicoes velhas na OKX: {err2}"
-    if pos:
-        det = ", ".join([f"{p['lado']} {p['pos_contratos']} entry {p['entry']} UPL {p['upl']}" for p in pos])
-        return False, f"Ha posicao velha, limpa primeiro: {det}. Fecha a mao e arranca de novo."
-    return True, None
 def okx_close_market_once(o, price):
     # CORRECAO 2: So fecha se PnL do bot > 0, e SO o Sz do bot.
     if o.get("closing"): return None, "JA A FECHAR"
@@ -514,16 +540,16 @@ def sync_positions_okx(price, passo):
             neg, _, _ = count_negativas()
             if len(neg)>=MAX_NEG_TOTAL:
                 log(f"ESPELHO BLOQUEADO {p['lado']} - ja ha 2 negativas"); continue
-            # Posicao na OKX sem ordem do bot = posicao velha. NAO cria espelho, PARA e avisa.
+            # Posicao na OKX sem ordem do bot = posicao estranha. NAO cria espelho, PARA e avisa.
             state["bloqueado_divergente"]=True; state["running"]=False
-            state["erro"]=f"PnL divergente: ha posicao na OKX sem ordem do bot: {p['lado']} {p['pos_contratos']} entry {p['entry']} UPL {p['upl']}. Fecha a mao e arranca de novo."
+            state["erro"]=f"PnL divergente: ha posicao na OKX sem ordem do bot: {p['lado']} {p['pos_contratos']} entry {p['entry']} UPL {p['upl']}. Carrega INICIAR para limpar sozinho."
             log(f"DIVERGENTE posicao sem bot {p}"); save(state); return
         else:
             for a in ativos:
                 pnl_bot = estimar_pnl(a, price)
                 if abs(pnl_bot - float(p["upl"])) > DIVERG_MAX:
                     state["bloqueado_divergente"]=True; state["running"]=False
-                    state["erro"]=f"PnL divergente: bot {pnl_bot} vs OKX {p['upl']} em {a['lado']}. Bot parado. Fecha a mao e arranca de novo."
+                    state["erro"]=f"PnL divergente: bot {pnl_bot} vs OKX {p['upl']} em {a['lado']}. Bot parado. Carrega INICIAR para limpar sozinho."
                     log(f"DIVERGENTE bot {pnl_bot} OKX {p['upl']}"); save(state); return
                 a["pnl"]=round(pnl_bot,4); a["espelho"]=True
 def bot_loop():
@@ -669,7 +695,7 @@ HTML='''
 let S={}; let ajPreenchido=false;
 function tab(n,el){['dash','merc','hist','aj'].forEach(x=>document.getElementById('tab-'+x).classList.toggle('hidden',x!==n));document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));el.classList.add('on')}
 async function load(){let r=await fetch('/api/state');S=await r.json();document.getElementById('topConta').textContent=S.settings.conta;document.getElementById('topCorr').textContent=S.settings.corretora+' • '+S.settings.moeda;document.getElementById('precoTxt').textContent=S.price.toFixed(1);let st=document.getElementById('saldoConta');st.textContent=S.saldo_conta.toFixed(2);st.className='big '+(S.saldo_conta>=0?'green':'red');let so=document.getElementById('saldoOp');so.textContent=S.saldo_op.toFixed(2);so.className='big '+(S.saldo_op>=0?'green':'red');let pv=document.getElementById('pnlVivo');pv.textContent=(S.pnl>=0?'+':'')+S.pnl.toFixed(2);pv.className='big '+(S.pnl>=0?'green':'red');document.getElementById('erroBox').innerHTML=S.erro?`<div class="erro">${S.erro}</div>`:'';document.getElementById('refbar').textContent=`Ref: ${S.ref.toFixed(1)}`;document.getElementById('merc').innerHTML=`Preço: ${S.price.toFixed(1)} | Ref: ${S.ref.toFixed(1)}`;document.getElementById('contagem').textContent=`${S.orders.length} / ${S.settings.total_ordens}`;let sh=S.orders.filter(o=>o.lado==='SHORT').map(o=>`<div class="ord">${o.lado} • ${o.tipo}<br>${o.ref.toFixed(1)} → ${o.alvo.toFixed(1)} • ${(o.pnl>=0?'+':'')+o.pnl.toFixed(2)}<br>Falta ${o.falta_pts.toFixed(0)} pontos</div>`).join('')||'—';let lo=S.orders.filter(o=>o.lado==='LONG').map(o=>`<div class="ord">${o.lado} • ${o.tipo}<br>${o.ref.toFixed(1)} → ${o.alvo.toFixed(1)} • ${(o.pnl>=0?'+':'')+o.pnl.toFixed(2)}<br>Falta ${o.falta_pts.toFixed(0)} pontos</div>`).join('')||'—';document.getElementById('shorts').innerHTML=sh;document.getElementById('longs').innerHTML=lo;let btn=document.getElementById('mainBtn');btn.textContent=S.running?'PARAR ROBÔ':'INICIAR BOT';btn.className='btn '+(S.running?'btn-stop':'btn-start');document.getElementById('histResumo').innerHTML=`<div class="big ${S.pnl_acumulado>=0?'green':'red'}">${S.pnl_acumulado>=0?'+':''}${S.pnl_acumulado.toFixed(2)}</div>`;document.getElementById('hist').innerHTML=S.history.map(x=>`<div class="histline">${x.lado} • ${x.hora} • ${(x.pnl>=0?'+':'')+x.pnl.toFixed(2)}<br>${x.entrada.toFixed(1)} → ${x.saida.toFixed(1)}</div>`).join('');let refs=S.orders.length?S.orders.map(o=>o.ref):[S.ref];let mn=Math.min(...refs,S.price)-50;let mx=Math.max(...refs,S.price)+50;let posP=(1-(S.price-mn)/(mx-mn))*100;let posR=(1-(S.ref-mn)/(mx-mn))*100;document.getElementById('priceLine').style.top=posP+'%';document.getElementById('refLine').style.top=posR+'%';let lbl=document.getElementById('priceLabel');lbl.style.top=(posP-8)+'px';lbl.textContent=S.price.toFixed(1);document.getElementById('ordDots').innerHTML=S.orders.filter(o=>o.tipo==='ACTIVE').map(o=>{let y=(1-(o.ref-mn)/(mx-mn))*100;let c=o.lado==='LONG'?'#2ecc71':'#e74c3c';return `<div style="position:absolute;left:${o.lado==='LONG'?'20%':'70%'};top:${y}%;width:10px;height:10px;border-radius:50%;background:${c}"></div>`}).join('');if(!ajPreenchido){ajPreenchido=true;document.getElementById('f_corretora').value=S.settings.corretora;document.getElementById('f_conta_tipo').value=S.settings.conta;document.getElementById('f_moeda').value=S.settings.moeda;document.getElementById('f_conta').value=S.settings.saldo_conta;document.getElementById('f_saldo_op').value=S.settings.saldo_op;document.getElementById('f_margem').value=S.settings.margem;document.getElementById('f_alav').value=S.settings.alav;document.getElementById('f_passo').value=S.settings.passo;document.getElementById('f_total').value=S.settings.total_ordens;document.getElementById('f_lucro').value=S.settings.lucro_op;document.getElementById('f_modo').value=S.settings.modo;document.getElementById('f_ops').value=S.settings.ops_dia;}}
-async function toggle(){if(S.running){await fetch('/api/toggle',{method:'POST'});ajPreenchido=false;load();return} if(S.settings.conta==='REAL'){if(!confirm('ATENÇÃO: Vais operar com DINHEIRO REAL. Confirmas?')) return} if(S.settings.conta==='TESTE'){if(!confirm('Vais operar na DEMO com ordens reais na Demo. Confirmas?')) return} await fetch('/api/toggle',{method:'POST'});ajPreenchido=false;load()}
+async function toggle(){if(S.running){await fetch('/api/toggle',{method:'POST'});ajPreenchido=false;load();return} if(S.settings.conta==='REAL'){if(!confirm('ATENÇÃO: Vais operar com DINHEIRO REAL. O bot vai LIMPAR posicoes e ordens velhas de BTC e arrancar limpo. Confirmas?')) return} if(S.settings.conta==='TESTE'){if(!confirm('Vais operar na DEMO. O bot vai LIMPAR posicoes e ordens velhas de BTC e arrancar limpo. Confirmas?')) return} await fetch('/api/toggle',{method:'POST'});ajPreenchido=false;load()}
 async function salvar(){let b={corretora:document.getElementById('f_corretora').value,conta:document.getElementById('f_conta_tipo').value,moeda:document.getElementById('f_moeda').value,saldo_conta:parseFloat(document.getElementById('f_conta').value),saldo_op:parseFloat(document.getElementById('f_saldo_op').value),margem:parseFloat(document.getElementById('f_margem').value),alav:parseFloat(document.getElementById('f_alav').value),passo:parseFloat(document.getElementById('f_passo').value),total_ordens:parseFloat(document.getElementById('f_total').value),lucro_op:parseFloat(document.getElementById('f_lucro').value),modo:document.getElementById('f_modo').value,ops_dia:parseFloat(document.getElementById('f_ops').value)};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert('Guardado');ajPreenchido=false;load()}
 setInterval(load,1500);load();
 </script></body></html>
@@ -691,11 +717,11 @@ def toggle():
         if state.get("usdt_available",0) < need: return jsonify({"ok":False,"erro":f"Available insuficiente: {state.get('usdt_available')} < {need}"}), 400
         if corretora_atual()=="OKX":
             if not okx_set_leverage(): return jsonify({"ok":False,"erro":"Falha alavancagem OKX."}), 400
-            # CORRECAO 1: Trava de arranque - se houver lixo velho, NAO arranca.
-            ok_clean, msg_clean = check_start_clean()
-            if not ok_clean:
-                state["erro"]=msg_clean; log(f"START BLOQUEADO: {msg_clean}"); save(state)
-                return jsonify({"ok":False,"erro":msg_clean}), 400
+            # LIMPA SOZINHO: em TESTE limpa sem perguntar, em REAL ja confirmou no botao. Se falhar, NAO arranca.
+            ok_limp, msg_limp = okx_auto_limpeza()
+            if not ok_limp:
+                state["erro"]=msg_limp; log(f"LIMPEZA FALHOU: {msg_limp}"); save(state)
+                return jsonify({"ok":False,"erro":msg_limp}), 400
     state["running"]=not state["running"]
     state["bloqueado_divergente"]=False
     if state["running"]:
@@ -711,7 +737,12 @@ def toggle():
         except: pass
         state["execucao"]=f"{corretora_atual()} {'DEMO' if is_teste() else 'REAL'}" if executar_real() else "PAPEL"
     else:
-        if executar_real() and corretora_atual()=="OKX": okx_cancel_all_open()
+        if executar_real() and corretora_atual()=="OKX":
+            # Ao PARAR, cancela tudo dele + cancela o que ficou na OKX
+            pend, _ = okx_get_pending()
+            for po in pend or []:
+                if po.get("ordId"): okx_cancel_order(po.get("ordId"))
+            okx_cancel_all_open()
         state["orders"]=[]; state["ref"]=state["price"]; state["encerramento"]=False
     save(state); return jsonify({"ok":True})
 @app.route("/api/settings",methods=["POST"])
