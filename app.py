@@ -1,19 +1,21 @@
-# ND-SCALPING V6 - BASE LIMPA - RESOLVE TODOS OS ERROS PROVADOS
-# BASE: Regras do comeco. Pinca Flutuante. Trava 40/20. Resgate. Max 2 negativas. Visual limpo.
-# ERROS RESOLVIDOS NESTA BASE (sem remendo por cima, tudo pensado junto):
-# E1 FANTASMA: PENDING mexe = cancela limite antiga na corretora + cria nova. 1 PENDING = 1 limite. Ao parar, cancela todas.
-# E2 FECHO GIGANTE: Fecha SO o Sz da ordem do bot. Nunca a posicao toda da corretora. Sz diferente do bot NAO conta.
-# E3 FECHO NEGATIVO: Nao existe caminho que feche com PnL <= 0. Trava, resgate, encerramento, parar - todos bloqueiam. Se Cofre nao cobre, fica a espera.
-# E4 3a NEGATIVA: Espelho tambem conta para o max. Com 2 negativas, nao cria espelho novo, nao abre ACTIVE novo.
-# E5 SALDO MISTURADO: Conta = Equity total. Disponivel = Available. Em uso = Equity - Disponivel. Funding FORA, nunca soma. Sem leitura, sem operacao.
-# E6 HISTORICO INFLADO: So conta fecho se Sz fechado == Sz do bot. Se Sz for diferente, regista como LIMPEZA e NAO soma ao total.
-# E7 VISUAL CHEIO: Ecra limpo. Lote, ordId, Fill, Fee, chaves, textos compridos ficam SO no codigo/logs. Ecra mostra so: Preco, Conta, Operacao, P&L vivo, Grid (Lado/Tipo/Ref->Alvo/PnL/Falta), Historico (Lado/Hora/PnL/Entrada->Saida).
+# ND-SCALPING V6 - CORRECAO - MANDA
+# VISUAL IGUAL A FOTO - NAO SE TIRA NENHUM CARTAO.
+# Cartoes SHORT vermelho / LONG verde, dentro: Lado - Tipo / Ref -> Alvo - PnL / Falta pontos. Em cima: Preco, Conta, Operacao, P&L vivo, botao PARAR ROBO, barra Ref amarela.
+# Lote, ordId, Fill, Fee, chaves ficam SO no codigo/logs, nunca no ecra.
+# CORRECOES APLICADAS (7):
+# C1 FANTASMA: PENDING mexe = cancela limite antiga PRIMEIRO. Se falhar cancelar, NAO cria nova. 1 PENDING = 1 limite. Ao parar, cancela todas.
+# C2 PnL DO BOT: PnL do cartao = calculado da entrada do bot (LONG: preco-entrada, SHORT: entrada-preco). UPL da OKX serve so para comparar, nunca substitui.
+# C3 NUNCA FECHA NEGATIVO: Trava, resgate, encerramento, parar - todos bloqueiam se PnL <= 0. Negativa fica a espera.
+# C4 MAX 2 NEGATIVAS: Conta bot + espelho. Com 2 negativas, nao cria espelho, nao abre ACTIVE novo.
+# C5 RESGATE SO COM COFRE: So fecha se Cofre >= custo + taxa. Se nao cobre, fica RESGATE A ESPERA, nao fecha.
+# C6 FECHO SO Sz DO BOT: Fecha so tamanho da ordem do bot. Se OKX devolver Sz diferente, NAO conta no historico, avisa DIVERGENTE.
+# C7 TRAVA SO DEPOIS DE ARMAR: Nao fecha a +0.01. So arma a 40% do passo. So fecha se apos armar houver recuo >= 20% do passo E PnL > 0. Lucro pode correr para infinito passado o alvo.
 import os, json, time, threading, random, hashlib, hmac, urllib.request, urllib.parse, base64, math
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string
 app = Flask(__name__)
-DATA_FILE = "/tmp/nd_v6_base_limpa.json"
+DATA_FILE = "/tmp/nd_v6_correcao.json"
 def now(): return (datetime.utcnow() + timedelta(hours=1)).strftime("%H:%M:%S")
 def load(): return json.load(open(DATA_FILE)) if os.path.exists(DATA_FILE) else None
 def save(s): open(DATA_FILE,"w").write(json.dumps(s))
@@ -84,7 +86,6 @@ def bitget_price(cfg):
 def env_keys(prefix):
     return os.environ.get(f"{prefix}_API_KEY","").strip(), os.environ.get(f"{prefix}_API_SECRET","").strip(), os.environ.get(f"{prefix}_PASSPHRASE","").strip()
 def apply_saldo(conta_total, equity_usdt, avail_usdt, upl_usdt, funding_usdt):
-    # E5: Conta = Equity total. Disponivel = Available. Em uso = Equity - Disponivel. Funding FORA.
     conta_total=float(conta_total or 0); equity_usdt=float(equity_usdt or 0); avail_usdt=float(avail_usdt or 0)
     in_use=round(max(0, equity_usdt-avail_usdt),4)
     state["est_total_usd"]=round(conta_total,4); state["saldo_trading"]=round(equity_usdt,4)
@@ -322,11 +323,11 @@ def okx_place_limit(lado, ref_price):
     log(f"PLACE {lado} Ref {ref_price} Sz {sz_str} ord {oid}")
     return oid, None, sz_str
 def okx_move_pending(o, novo_ref):
-    # E1: Cancela antiga + cria nova. Nunca deixa 2 limites para 1 PENDING.
+    # C1: Cancela antiga PRIMEIRO. Se falhar, NAO cria nova.
     if executar_real() and corretora_atual()=="OKX" and o.get("okx_ord_id"):
         ok, err = okx_cancel_order(o.get("okx_ord_id"))
         if not ok:
-            state["erro"]=f"Falha cancelar limite antiga {o['lado']} {o['ref']}: {err}"; log(f"MOVE FAIL cancel {err}"); return False
+            state["erro"]=f"Falha cancelar limite antiga {o['lado']} {o['ref']}: {err}"; log(f"MOVE BLOQUEADO cancel {err} - nao cria nova"); return False
         o["okx_ord_id"]=None
     passo=state["settings"]["passo"] or 15
     o["ref"]=novo_ref; o["entrada"]=novo_ref; o["alvo"]=round(novo_ref+passo,1) if o["lado"]=="LONG" else round(novo_ref-passo,1)
@@ -337,7 +338,7 @@ def okx_move_pending(o, novo_ref):
         o["okx_ord_id"]=oid; o["sz"]=sz_str
     return True
 def okx_close_market_once(o, price):
-    # E3 + E2: So fecha se PnL > 0, e SO o Sz do bot.
+    # C3 + C6: So fecha se PnL do bot > 0, e SO o Sz do bot.
     if o.get("closing"): return None, "JA A FECHAR"
     pnl_pre = o.get("pnl", 0)
     if pnl_pre is not None and pnl_pre <= 0:
@@ -345,7 +346,6 @@ def okx_close_market_once(o, price):
     cfg,_ = moeda_cfg()
     sz_str = o.get("sz")
     if not sz_str: sz_str, _, _ = calc_sz(price or 60000)
-    # E2: Nunca usa posicao toda da corretora. So Sz do bot.
     log(f"CLOSE {o['lado']} Ref {o['ref']} Sz BOT {sz_str} PnL pre {pnl_pre}")
     o["closing"]=True; o["closing_em"]=now()
     side="sell" if o["lado"]=="LONG" else "buy"
@@ -371,10 +371,8 @@ def okx_close_market_once(o, price):
         except: sz_f=calc_sz_float(fill_px)
         mov=(fill_px-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-fill_px)
         pnl_real=round(mov*sz_f*lote["ctVal"]-fee,4)
-    # E3: Se corretora devolver negativo, NAO fecha. Reverte.
     if pnl_real is not None and pnl_real <= 0:
         o["closing"]=False; log(f"CLOSE BLOQUEADO corretora devolveu {pnl_real}"); return None, f"BLOQUEADO corretora devolveu {pnl_real} <= 0"
-    # E6: Se Sz fechado for diferente do Sz do bot, NAO conta. E limpeza, nao lucro.
     if fill_sz is not None:
         try:
             sz_bot=float(sz_str)
@@ -415,6 +413,7 @@ def add_order_keep_cap(new_o):
         else: return False
     state["orders"].append(new_o); return True
 def estimar_pnl(o, exit_price):
+    # C2: PnL sempre da entrada do bot.
     passo=state["settings"]["passo"] or 15
     mov=(exit_price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-exit_price)
     valor=min(float(state["settings"].get("margem") or 5.0),5.0); taxa=valor*0.00055*2
@@ -427,7 +426,7 @@ def estimar_pnl(o, exit_price):
         if mov<0: pnl_bruto=round(mov*0.0015,4)
         return round(pnl_bruto-taxa,4)
 def close_order(o, exit_price, motivo, pnl_forcado=None):
-    # E3: Nunca fecha negativo. PAPEL e REAL igual.
+    # C3: Nunca fecha negativo. C7: So chega aqui se ja armou.
     if executar_real() and corretora_atual()=="OKX" and pnl_forcado is None:
         pnl_est = estimar_pnl(o, exit_price)
         if pnl_est <= 0:
@@ -456,13 +455,11 @@ def close_order(o, exit_price, motivo, pnl_forcado=None):
     state["history"].insert(0, {"lado":o["lado"],"entrada":o["ref"],"saida":exit_price,"pnl":round(pnl,2),"motivo":motivo,"hora":now()})
     state["history"]=state["history"][:200]; return pnl
 def close_resgate(o, price):
-    # E3: Resgate SO se Cofre cobre tudo. Se nao cobre, NAO fecha.
+    # C5: Resgate SO se Cofre cobre tudo.
     custo = abs(o.get("pnl",0)); custo_total = round(custo + TAXA_FECHO_EST,4); cofre = state.get("cofre_resgate",0)
     if cofre < custo_total or custo<=0:
-        o["trava"]=f"RESGATE A ESPERA"; log(f"RESGATE ESPERA cofre {cofre} < custo {custo_total}"); return False
+        o["trava"]="RESGATE A ESPERA"; log(f"RESGATE ESPERA cofre {cofre} < custo {custo_total}"); return False
     if executar_real() and corretora_atual()=="OKX":
-        # Em REAL, resgate nao pode registar negativo. Se o fill vier positivo, e lucro, nao resgate.
-        # Se vier negativo, okx_close ja bloqueia. Entao: tenta fechar, se vier positivo regista como lucro e NAO toca no Cofre como resgate.
         res, err = okx_close_market_once(o, price)
         if err:
             o["trava"]="RESGATE BLOQUEADO - NAO FECHA"; log(f"RESGATE BLOQUEADO {err}"); return False
@@ -495,7 +492,7 @@ def try_rescue_close(price):
     mais_antiga = neg[0]; custo = abs(mais_antiga.get("pnl",0)); custo_total = round(custo + TAXA_FECHO_EST,4)
     if state.get("cofre_resgate",0) >= custo_total and custo>0: close_resgate(mais_antiga, price)
 def sync_positions_okx(price, passo):
-    # E4: Espelho tambem respeita max 2. Se ja houver 2 negativas, nao cria espelho.
+    # C4: Espelho tambem respeita max 2.
     if not executar_real() or corretora_atual()!="OKX": return
     pos_list, err = okx_get_positions()
     if err: return
@@ -506,15 +503,17 @@ def sync_positions_okx(price, passo):
             neg, _, _ = count_negativas()
             if len(neg)>=MAX_NEG_TOTAL:
                 log(f"ESPELHO BLOQUEADO {p['lado']} - ja ha 2 negativas"); continue
-            # Espelho: usa Entry real, mas Sz do BOT, nao posicao toda. So para mostrar, nao para fechar gigante.
             sz_bot, _, _ = calc_sz(p["entry"])
             o=mk_order(p["lado"], p["entry"], passo, "ESPELHO")
             o["tipo"]="ACTIVE"; o["preco_fill"]=p["entry"]; o["best"]=p["entry"]; o["sz"]=sz_bot; o["pnl"]=round(p["upl"],4); o["espelho"]=True
             state["orders"].append(o); log(f"ESPELHO CRIADO {p['lado']} Entry {p['entry']} UPL {p['upl']} Sz BOT {sz_bot} (pos OKX {p['pos_contratos']} nao usada para fechar)")
         else:
             for a in ativos:
-                # E2: Nao sobrescreve Sz do bot com posicao toda. So atualiza PnL para mostrar.
-                a["pnl"]=round(p["upl"],4); a["espelho"]=True
+                # C2: Nao sobrescreve Sz do bot. So compara PnL, nao substitui.
+                pnl_bot = estimar_pnl(a, price)
+                if abs(pnl_bot - float(p["upl"])) > 0.5:
+                    log(f"PnL DIVERGENTE {a['lado']} bot {pnl_bot} OKX {p['upl']} - mostra o do bot")
+                a["pnl"]=round(pnl_bot,4); a["espelho"]=True
 def bot_loop():
     while True:
         try:
@@ -580,13 +579,9 @@ def bot_loop():
                         if o.get("closing"): continue
                         mov=(price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-price)
                         o["falta_pts"]=round(abs(mov),1) if mov<0 else round(max(0, passo-mov),1)
-                        if not o.get("espelho"):
-                            if executar_real():
-                                try: sz_f=float(o.get("sz") or 0)
-                                except: sz_f=0
-                                lote=okx_lote(); o["pnl"]=round(mov*sz_f*lote["ctVal"],4)
-                            else: o["pnl"]=round(mov*0.0015,4)
-                        # E3: So passa pela trava se PnL > 0
+                        # C2: PnL sempre da entrada do bot, em PAPEL e REAL.
+                        o["pnl"]=estimar_pnl(o, price)
+                        # C7: Trava SO depois de armar a 40%. So fecha se recuo >= 20% E PnL > 0.
                         if o.get("pnl",0)>0:
                             mov2=(price-o["ref"]) if o["lado"]=="LONG" else (o["ref"]-price)
                             if o.get("best") is None: o["best"]=price
@@ -613,7 +608,6 @@ def bot_loop():
                     if not ativos: state["running"]=False; state["orders"]=[]; state["ref"]=state["price"]; save(state)
                     else:
                         for o in list(ativos):
-                            # E3: Encerramento so fecha se PnL > 0
                             if o["pnl"]>0:
                                 total_se=state["pnl_acumulado"]+o["pnl"]
                                 if total_se>=alvo:
